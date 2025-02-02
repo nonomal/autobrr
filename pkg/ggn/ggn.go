@@ -1,47 +1,64 @@
+// Copyright (c) 2021 - 2025, Ludvig Lundgren and the autobrr contributors.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 package ggn
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"strconv"
 	"time"
 
 	"github.com/autobrr/autobrr/internal/domain"
+	"github.com/autobrr/autobrr/pkg/errors"
+	"github.com/autobrr/autobrr/pkg/sharedhttp"
 
-	"github.com/rs/zerolog/log"
 	"golang.org/x/time/rate"
 )
 
-type Client interface {
-	GetTorrentByID(torrentID string) (*domain.TorrentBasic, error)
-	TestAPI() (bool, error)
+const DefaultURL = "https://gazellegames.net/api.php"
+
+var ErrUnauthorized = errors.New("unauthorized: bad credentials")
+var ErrForbidden = errors.New("forbidden")
+var ErrTooManyRequests = errors.New("too many requests: rate-limit reached")
+
+type ApiClient interface {
+	GetTorrentByID(ctx context.Context, torrentID string) (*domain.TorrentBasic, error)
+	TestAPI(ctx context.Context) (bool, error)
 }
 
-type client struct {
-	Url         string
-	Timeout     int
+type Client struct {
+	url         string
 	client      *http.Client
-	Ratelimiter *rate.Limiter
+	rateLimiter *rate.Limiter
 	APIKey      string
-	Headers     http.Header
 }
 
-func NewClient(url string, apiKey string) Client {
-	// set default url
-	if url == "" {
-		url = "https://gazellegames.net/api.php"
+type OptFunc func(*Client)
+
+func WithUrl(url string) OptFunc {
+	return func(c *Client) {
+		c.url = url
+	}
+}
+
+func NewClient(apiKey string, opts ...OptFunc) ApiClient {
+	c := &Client{
+		url: DefaultURL,
+		client: &http.Client{
+			Timeout:   time.Second * 30,
+			Transport: sharedhttp.Transport,
+		},
+		rateLimiter: rate.NewLimiter(rate.Every(5*time.Second), 1), // 5 request every 10 seconds
+		APIKey:      apiKey,
 	}
 
-	c := &client{
-		APIKey:      apiKey,
-		client:      http.DefaultClient,
-		Url:         url,
-		Ratelimiter: rate.NewLimiter(rate.Every(5*time.Second), 1), // 5 request every 10 seconds
+	for _, opt := range opts {
+		opt(c)
 	}
 
 	return c
@@ -59,39 +76,41 @@ type Group struct {
 	CategoryName string   `json:"categoryName"`
 	MasterGroup  int      `json:"masterGroup"`
 	Time         string   `json:"time"`
-	GameInfo     struct {
-		Screenshots []string `json:"screenshots"`
-		Trailer     string   `json:"trailer"`
-		Rating      string   `json:"rating"`
-		MetaRating  struct {
-			Score   string `json:"score"`
-			Percent string `json:"percent"`
-			Link    string `json:"link"`
-		} `json:"metaRating"`
-		IgnRating struct {
-			Score   string `json:"score"`
-			Percent string `json:"percent"`
-			Link    string `json:"link"`
-		} `json:"ignRating"`
-		GamespotRating struct {
-			Score   string `json:"score"`
-			Percent string `json:"percent"`
-			Link    string `json:"link"`
-		} `json:"gamespotRating"`
-		Weblinks struct {
-			GamesWebsite  string `json:"GamesWebsite"`
-			Wikipedia     string `json:"Wikipedia"`
-			Giantbomb     string `json:"Giantbomb"`
-			GameFAQs      string `json:"GameFAQs"`
-			PCGamingWiki  string `json:"PCGamingWiki"`
-			Steam         string `json:"Steam"`
-			Amazon        string `json:"Amazon"`
-			GOG           string `json:"GOG"`
-			HowLongToBeat string `json:"HowLongToBeat"`
-		} `json:"weblinks"`
-	} `json:"gameInfo"`
-	Tags     []string `json:"tags"`
-	Platform string   `json:"platform"`
+	Tags         []string `json:"tags"`
+	Platform     string   `json:"platform"`
+}
+
+type GameInfo struct {
+	Screenshots []string `json:"screenshots"`
+	Trailer     string   `json:"trailer"`
+	Rating      string   `json:"rating"`
+	MetaRating  struct {
+		Score   string `json:"score"`
+		Percent string `json:"percent"`
+		Link    string `json:"link"`
+	} `json:"metaRating"`
+	IgnRating struct {
+		Score   string `json:"score"`
+		Percent string `json:"percent"`
+		Link    string `json:"link"`
+	} `json:"ignRating"`
+	GamespotRating struct {
+		Score   string `json:"score"`
+		Percent string `json:"percent"`
+		Link    string `json:"link"`
+	} `json:"gamespotRating"`
+	Weblinks struct {
+		GamesWebsite  string `json:"GamesWebsite"`
+		Wikipedia     string `json:"Wikipedia"`
+		Giantbomb     string `json:"Giantbomb"`
+		GameFAQs      string `json:"GameFAQs"`
+		PCGamingWiki  string `json:"PCGamingWiki"`
+		Steam         string `json:"Steam"`
+		Amazon        string `json:"Amazon"`
+		GOG           string `json:"GOG"`
+		HowLongToBeat string `json:"HowLongToBeat"`
+	} `json:"weblinks"`
+	//`json:"gameInfo"`
 }
 
 type Torrent struct {
@@ -144,24 +163,30 @@ type Response struct {
 	Error    string          `json:"error,omitempty"`
 }
 
-func (c *client) Do(req *http.Request) (*http.Response, error) {
+type GetIndexResponse struct {
+	Status   string `json:"status"`
+	Response struct {
+		ApiVersion string `json:"api_version"`
+	} `json:"response"`
+}
+
+func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	ctx := context.Background()
-	err := c.Ratelimiter.Wait(ctx) // This is a blocking call. Honors the rate limit
+	err := c.rateLimiter.Wait(ctx) // This is a blocking call. Honors the rate limit
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "error waiting for ratelimiter")
 	}
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return nil, err
+		return resp, errors.Wrap(err, "error making request")
 	}
 	return resp, nil
 }
 
-func (c *client) get(url string) (*http.Response, error) {
-	req, err := http.NewRequest(http.MethodGet, url, http.NoBody)
+func (c *Client) get(ctx context.Context, url string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
 	if err != nil {
-		log.Error().Err(err).Msgf("ggn client request error : %v", url)
-		return nil, err
+		return nil, errors.Wrap(err, "ggn client request error : %s", url)
 	}
 
 	req.Header.Add("X-API-Key", c.APIKey)
@@ -169,77 +194,110 @@ func (c *client) get(url string) (*http.Response, error) {
 
 	res, err := c.Do(req)
 	if err != nil {
-		log.Error().Err(err).Msgf("ggn client request error : %v", url)
-		return nil, err
+		return res, errors.Wrap(err, "ggn client request error : %s", url)
 	}
 
 	if res.StatusCode == http.StatusUnauthorized {
-		return nil, errors.New("unauthorized: bad credentials")
+		return res, ErrUnauthorized
 	} else if res.StatusCode == http.StatusForbidden {
-		return nil, nil
+		return res, ErrForbidden
 	} else if res.StatusCode == http.StatusTooManyRequests {
-		return nil, nil
+		return res, ErrTooManyRequests
 	}
 
 	return res, nil
 }
 
-func (c *client) GetTorrentByID(torrentID string) (*domain.TorrentBasic, error) {
+func (c *Client) getJSON(ctx context.Context, params url.Values, data any) error {
+	reqUrl := fmt.Sprintf("%s?%s", c.url, params.Encode())
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqUrl, http.NoBody)
+	if err != nil {
+		return errors.Wrap(err, "ggn client request error : %s", reqUrl)
+	}
+
+	req.Header.Add("X-API-Key", c.APIKey)
+	req.Header.Set("User-Agent", "autobrr")
+
+	res, err := c.Do(req)
+	if err != nil {
+		return errors.Wrap(err, "ggn client request error : %s", reqUrl)
+	}
+
+	defer res.Body.Close()
+
+	if res.StatusCode == http.StatusUnauthorized {
+		return ErrUnauthorized
+	} else if res.StatusCode == http.StatusForbidden {
+		return ErrForbidden
+	} else if res.StatusCode == http.StatusTooManyRequests {
+		return ErrTooManyRequests
+	}
+
+	reader := bufio.NewReader(res.Body)
+
+	if err := json.NewDecoder(reader).Decode(&data); err != nil {
+		return errors.Wrap(err, "error unmarshal body")
+	}
+
+	return nil
+}
+
+func (c *Client) GetTorrentByID(ctx context.Context, torrentID string) (*domain.TorrentBasic, error) {
 	if torrentID == "" {
-		return nil, fmt.Errorf("ggn client: must have torrentID")
+		return nil, errors.New("ggn client: must have torrentID")
 	}
 
-	var r Response
+	var response *Response
 
-	v := url.Values{}
-	v.Add("id", torrentID)
-	params := v.Encode()
+	params := url.Values{}
+	params.Add("request", "torrent")
+	params.Add("id", torrentID)
 
-	url := fmt.Sprintf("%v?%v&%v", c.Url, "request=torrent", params)
-
-	resp, err := c.get(url)
+	err := c.getJSON(ctx, params, &response)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "error getting data")
 	}
 
-	defer resp.Body.Close()
-
-	body, readErr := ioutil.ReadAll(resp.Body)
-	if readErr != nil {
-		return nil, readErr
-	}
-
-	err = json.Unmarshal(body, &r)
-	if err != nil {
-		return nil, err
-	}
-
-	if r.Status != "success" {
-		return nil, fmt.Errorf("bad status: %v", r.Status)
+	if response.Status != "success" {
+		return nil, errors.New("bad status: %s", response.Status)
 	}
 
 	t := &domain.TorrentBasic{
-		Id:       strconv.Itoa(r.Response.Torrent.Id),
-		InfoHash: r.Response.Torrent.InfoHash,
-		Size:     strconv.FormatUint(r.Response.Torrent.Size, 10),
+		Id:       strconv.Itoa(response.Response.Torrent.Id),
+		InfoHash: response.Response.Torrent.InfoHash,
+		Size:     strconv.FormatUint(response.Response.Torrent.Size, 10),
 	}
 
 	return t, nil
-
 }
 
-// TestAPI try api access against torrents page
-func (c *client) TestAPI() (bool, error) {
-	resp, err := c.get(c.Url)
+// TestAPI try api access against index
+func (c *Client) TestAPI(ctx context.Context) (bool, error) {
+	resp, err := c.GetIndex(ctx)
 	if err != nil {
-		return false, err
+		return false, errors.Wrap(err, "test api error")
 	}
 
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusOK {
-		return true, nil
+	if resp == nil {
+		return false, nil
 	}
 
-	return false, nil
+	return true, nil
+}
+
+func (c *Client) GetIndex(ctx context.Context) (*GetIndexResponse, error) {
+	var response *GetIndexResponse
+
+	params := url.Values{}
+	err := c.getJSON(ctx, params, &response)
+	if err != nil {
+		return nil, errors.Wrap(err, "error getting data")
+	}
+
+	if response.Status != "success" {
+		return nil, errors.New("bad status: %s", response.Status)
+	}
+
+	return response, nil
 }

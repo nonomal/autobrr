@@ -1,13 +1,20 @@
+// Copyright (c) 2021 - 2025, Ludvig Lundgren and the autobrr contributors.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 package whisparr
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/rs/zerolog/log"
+	"github.com/autobrr/autobrr/pkg/errors"
+	"github.com/autobrr/autobrr/pkg/sharedhttp"
 )
 
 type Config struct {
@@ -18,27 +25,36 @@ type Config struct {
 	BasicAuth bool
 	Username  string
 	Password  string
+
+	Log *log.Logger
 }
 
 type Client interface {
-	Test() (*SystemStatusResponse, error)
-	Push(release Release) ([]string, error)
+	Test(ctx context.Context) (*SystemStatusResponse, error)
+	Push(ctx context.Context, release Release) ([]string, error)
 }
 
 type client struct {
 	config Config
 	http   *http.Client
+
+	Log *log.Logger
 }
 
 func New(config Config) Client {
-
 	httpClient := &http.Client{
-		Timeout: time.Second * 30,
+		Timeout:   time.Second * 120,
+		Transport: sharedhttp.Transport,
 	}
 
 	c := &client{
 		config: config,
 		http:   httpClient,
+		Log:    log.New(io.Discard, "", log.LstdFlags),
+	}
+
+	if config.Log != nil {
+		c.Log = config.Log
 	}
 
 	return c
@@ -46,12 +62,16 @@ func New(config Config) Client {
 
 type Release struct {
 	Title            string `json:"title"`
-	DownloadUrl      string `json:"downloadUrl"`
-	Size             int64  `json:"size"`
+	InfoUrl          string `json:"infoUrl,omitempty"`
+	DownloadUrl      string `json:"downloadUrl,omitempty"`
+	MagnetUrl        string `json:"magnetUrl,omitempty"`
+	Size             uint64 `json:"size"`
 	Indexer          string `json:"indexer"`
 	DownloadProtocol string `json:"downloadProtocol"`
 	Protocol         string `json:"protocol"`
 	PublishDate      string `json:"publishDate"`
+	DownloadClientId int    `json:"downloadClientId,omitempty"`
+	DownloadClient   string `json:"downloadClient,omitempty"`
 }
 
 type PushResponse struct {
@@ -65,38 +85,34 @@ type SystemStatusResponse struct {
 	Version string `json:"version"`
 }
 
-func (c *client) Test() (*SystemStatusResponse, error) {
-	res, err := c.get("system/status")
+func (c *client) Test(ctx context.Context) (*SystemStatusResponse, error) {
+	res, err := c.get(ctx, "system/status")
 	if err != nil {
-		log.Error().Stack().Err(err).Msg("whisparr client get error")
-		return nil, err
+		return nil, errors.Wrap(err, "could not test whisparr")
 	}
 
 	defer res.Body.Close()
 
-	body, err := io.ReadAll(res.Body)
+	body, err := io.ReadAll(bufio.NewReader(res.Body))
 	if err != nil {
-		log.Error().Stack().Err(err).Msg("whisparr client error reading body")
-		return nil, err
+		return nil, errors.Wrap(err, "could not read body")
 	}
 
 	response := SystemStatusResponse{}
 	err = json.Unmarshal(body, &response)
 	if err != nil {
-		log.Error().Stack().Err(err).Msg("whisparr client error json unmarshal")
-		return nil, err
+		return nil, errors.Wrap(err, "could not unmarshal data")
 	}
 
-	log.Trace().Msgf("whisparr system/status response: %+v", response)
+	c.Log.Printf("whisparr system/status status: (%v) response: %v\n", res.Status, string(body))
 
 	return &response, nil
 }
 
-func (c *client) Push(release Release) ([]string, error) {
-	res, err := c.post("release/push", release)
+func (c *client) Push(ctx context.Context, release Release) ([]string, error) {
+	res, err := c.post(ctx, "release/push", release)
 	if err != nil {
-		log.Error().Stack().Err(err).Msg("whisparr client post error")
-		return nil, err
+		return nil, errors.Wrap(err, "could not push release to whisparr: %+v", release)
 	}
 
 	if res == nil {
@@ -105,26 +121,24 @@ func (c *client) Push(release Release) ([]string, error) {
 
 	defer res.Body.Close()
 
-	body, err := io.ReadAll(res.Body)
+	body, err := io.ReadAll(bufio.NewReader(res.Body))
 	if err != nil {
-		log.Error().Stack().Err(err).Msg("whisparr client error reading body")
-		return nil, err
+		return nil, errors.Wrap(err, "could not read body")
 	}
 
 	pushResponse := make([]PushResponse, 0)
 	err = json.Unmarshal(body, &pushResponse)
 	if err != nil {
-		log.Error().Stack().Err(err).Msg("whisparr client error json unmarshal")
-		return nil, err
+		return nil, errors.Wrap(err, "could not unmarshal data")
 	}
 
-	log.Trace().Msgf("whisparr release/push response body: %+v", string(body))
+	c.Log.Printf("whisparr release/push status: (%v) response: %v\n", res.Status, string(body))
 
 	// log and return if rejected
 	if pushResponse[0].Rejected {
 		rejections := strings.Join(pushResponse[0].Rejections, ", ")
 
-		log.Trace().Msgf("whisparr push rejected: %s - reasons: %q", release.Title, rejections)
+		c.Log.Printf("whisparr release/push rejected %v reasons: %q\n", release.Title, rejections)
 		return pushResponse[0].Rejections, nil
 	}
 

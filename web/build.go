@@ -1,61 +1,62 @@
+// Copyright (c) 2021 - 2025, Ludvig Lundgren and the autobrr contributors.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 // Package web web/build.go
 package web
 
 import (
 	"embed"
-	"html/template"
-	"io"
+	"fmt"
 	"io/fs"
-	"net/http"
 	"os"
-	"path"
+	"path/filepath"
 )
 
-//go:embed build
-var Assets embed.FS
+var (
+	//go:embed all:dist
+	Dist embed.FS
 
-// fsFunc is short-hand for constructing a http.FileSystem
-// implementation
-type fsFunc func(name string) (fs.File, error)
+	DistDirFS = MustSubFS(Dist, "dist")
+)
 
-func (f fsFunc) Open(name string) (fs.File, error) {
-	return f(name)
+type defaultFS struct {
+	prefix string
+	fs     fs.FS
 }
 
-// AssetHandler returns a http.Handler that will serve files from
-// the Assets embed.FS.  When locating a file, it will strip the given
-// prefix from the request and prepend the root to the filesystem
-// lookup: typical prefix might be /web/, and root would be build.
-func AssetHandler(prefix, root string) http.Handler {
-	handler := fsFunc(func(name string) (fs.File, error) {
-		assetPath := path.Join(root, name)
+func (fs defaultFS) Open(name string) (fs.File, error) {
+	if fs.fs == nil {
+		return os.Open(name)
+	}
+	return fs.fs.Open(name)
+}
 
-		// If we can't find the asset, return the default index.html
-		// content
-		f, err := Assets.Open(assetPath)
-		if os.IsNotExist(err) {
-			return Assets.Open("build/index.html")
+// MustSubFS creates sub FS from current filesystem or panic on failure.
+// Panic happens when `fsRoot` contains invalid path according to `fs.ValidPath` rules.
+//
+// MustSubFS is helpful when dealing with `embed.FS` because for example `//go:embed assets/images` embeds files with
+// paths including `assets/images` as their prefix. In that case use `fs := MustSubFS(fs, "rootDirectory") to
+// create sub fs which uses necessary prefix for directory path.
+func MustSubFS(currentFs fs.FS, fsRoot string) fs.FS {
+	subFs, err := subFS(currentFs, fsRoot)
+	if err != nil {
+		panic(fmt.Errorf("can not create sub FS, invalid root given, err: %w", err))
+	}
+	return subFs
+}
+
+func subFS(currentFs fs.FS, root string) (fs.FS, error) {
+	root = filepath.ToSlash(filepath.Clean(root)) // note: fs.FS operates only with slashes. `ToSlash` is necessary for Windows
+	if dFS, ok := currentFs.(*defaultFS); ok {
+		// we need to make exception for `defaultFS` instances as it interprets root prefix differently from fs.FS.
+		// fs.Fs.Open does not like relative paths ("./", "../") and absolute paths.
+		if !filepath.IsAbs(root) {
+			root = filepath.Join(dFS.prefix, root)
 		}
-
-		// Otherwise, assume this is a legitimate request routed
-		// correctly
-		return f, err
-	})
-
-	return http.StripPrefix(prefix, http.FileServer(http.FS(handler)))
-}
-
-type IndexParams struct {
-	Title   string
-	Version string
-	BaseUrl string
-}
-
-func Index(w io.Writer, p IndexParams) error {
-	return parseIndex().Execute(w, p)
-}
-
-func parseIndex() *template.Template {
-	return template.Must(
-		template.New("index.html").ParseFS(Assets, "build/index.html"))
+		return &defaultFS{
+			prefix: root,
+			fs:     os.DirFS(root),
+		}, nil
+	}
+	return fs.Sub(currentFs, root)
 }

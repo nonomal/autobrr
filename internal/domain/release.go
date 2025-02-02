@@ -1,935 +1,963 @@
+// Copyright (c) 2021 - 2025, Ludvig Lundgren and the autobrr contributors.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 package domain
 
 import (
+	"bufio"
 	"bytes"
 	"context"
-	"crypto/tls"
+	"crypto/md5"
+	"encoding/hex"
 	"fmt"
 	"html"
 	"io"
+	"math"
 	"net/http"
 	"net/http/cookiejar"
-	"net/url"
 	"os"
-	"regexp"
+	"slices"
 	"strconv"
 	"strings"
-	"text/template"
 	"time"
+	"unicode"
 
-	"golang.org/x/net/publicsuffix"
+	"github.com/autobrr/autobrr/pkg/errors"
+	"github.com/autobrr/autobrr/pkg/sharedhttp"
 
-	"github.com/autobrr/autobrr/pkg/wildcard"
-
+	"github.com/anacrolix/torrent/bencode"
 	"github.com/anacrolix/torrent/metainfo"
+	"github.com/avast/retry-go"
 	"github.com/dustin/go-humanize"
-	"github.com/pkg/errors"
-	"github.com/rs/zerolog/log"
+	"github.com/moistari/rls"
+	"golang.org/x/net/publicsuffix"
+	"golang.org/x/text/transform"
+	"golang.org/x/text/unicode/norm"
 )
 
 type ReleaseRepo interface {
-	Store(ctx context.Context, release *Release) (*Release, error)
-	Find(ctx context.Context, params ReleaseQueryParams) (res []*Release, nextCursor int64, count int64, err error)
+	Store(ctx context.Context, release *Release) error
+	Update(ctx context.Context, r *Release) error
+	Find(ctx context.Context, params ReleaseQueryParams) (*FindReleasesResponse, error)
+	Get(ctx context.Context, req *GetReleaseRequest) (*Release, error)
 	GetIndexerOptions(ctx context.Context) ([]string, error)
-	GetActionStatusByReleaseID(ctx context.Context, releaseID int64) ([]ReleaseActionStatus, error)
 	Stats(ctx context.Context) (*ReleaseStats, error)
-	StoreReleaseActionStatus(ctx context.Context, actionStatus *ReleaseActionStatus) error
-	Delete(ctx context.Context) error
+	Delete(ctx context.Context, req *DeleteReleaseRequest) error
+	CheckSmartEpisodeCanDownload(ctx context.Context, p *SmartEpisodeParams) (bool, error)
+	UpdateBaseURL(ctx context.Context, indexer string, oldBaseURL, newBaseURL string) error
+
+	GetActionStatus(ctx context.Context, req *GetReleaseActionStatusRequest) (*ReleaseActionStatus, error)
+	StoreReleaseActionStatus(ctx context.Context, status *ReleaseActionStatus) error
+
+	StoreDuplicateProfile(ctx context.Context, profile *DuplicateReleaseProfile) error
+	FindDuplicateReleaseProfiles(ctx context.Context) ([]*DuplicateReleaseProfile, error)
+	DeleteReleaseProfileDuplicate(ctx context.Context, id int64) error
+	CheckIsDuplicateRelease(ctx context.Context, profile *DuplicateReleaseProfile, release *Release) (bool, error)
 }
 
 type Release struct {
-	ID                          int64                 `json:"id"`
-	FilterStatus                ReleaseFilterStatus   `json:"filter_status"`
-	Rejections                  []string              `json:"rejections"`
-	Indexer                     string                `json:"indexer"`
-	FilterName                  string                `json:"filter"`
-	Protocol                    ReleaseProtocol       `json:"protocol"`
-	Implementation              ReleaseImplementation `json:"implementation"` // irc, rss, api
-	Timestamp                   time.Time             `json:"timestamp"`
-	GroupID                     string                `json:"group_id"`
-	TorrentID                   string                `json:"torrent_id"`
-	TorrentURL                  string                `json:"-"`
-	TorrentTmpFile              string                `json:"-"`
-	TorrentHash                 string                `json:"-"`
-	TorrentName                 string                `json:"torrent_name"` // full release name
-	Size                        uint64                `json:"size"`
-	Raw                         string                `json:"raw"`   // Raw release
-	Clean                       string                `json:"clean"` // cleaned release name
-	Title                       string                `json:"title"` // Parsed title
-	Category                    string                `json:"category"`
-	Season                      int                   `json:"season"`
-	Episode                     int                   `json:"episode"`
-	Year                        int                   `json:"year"`
-	Resolution                  string                `json:"resolution"`
-	Source                      string                `json:"source"` // CD, DVD, Vinyl, DAT, Cassette, WEB, Other
-	Codec                       string                `json:"codec"`
-	Container                   string                `json:"container"`
-	HDR                         string                `json:"hdr"`
-	Audio                       string                `json:"audio"`
-	Group                       string                `json:"group"`
-	Region                      string                `json:"region"`
-	Language                    string                `json:"language"`
-	Edition                     string                `json:"edition"` // Extended, directors cut
-	Unrated                     bool                  `json:"unrated"`
-	Hybrid                      bool                  `json:"hybrid"`
-	Proper                      bool                  `json:"proper"`
-	Repack                      bool                  `json:"repack"`
-	Website                     string                `json:"website"`
-	ThreeD                      bool                  `json:"-"`
-	Artists                     []string              `json:"artists"`
-	Type                        string                `json:"type"`    // Album,Single,EP
-	Format                      string                `json:"format"`  // music only
-	Quality                     string                `json:"quality"` // quality
-	LogScore                    int                   `json:"log_score"`
-	HasLog                      bool                  `json:"has_log"`
-	HasCue                      bool                  `json:"has_cue"`
-	IsScene                     bool                  `json:"is_scene"`
-	Origin                      string                `json:"origin"` // P2P, Internal
-	Tags                        []string              `json:"tags"`
-	ReleaseTags                 string                `json:"-"`
-	Freeleech                   bool                  `json:"freeleech"`
-	FreeleechPercent            int                   `json:"freeleech_percent"`
-	Uploader                    string                `json:"uploader"`
-	PreTime                     string                `json:"pre_time"`
-	RawCookie                   string                `json:"-"`
-	AdditionalSizeCheckRequired bool                  `json:"-"`
-	FilterID                    int                   `json:"-"`
-	Filter                      *Filter               `json:"-"`
-	ActionStatus                []ReleaseActionStatus `json:"action_status"`
+	ID                                 int64                 `json:"id"`
+	FilterStatus                       ReleaseFilterStatus   `json:"filter_status"`
+	Rejections                         []string              `json:"rejections"`
+	Indexer                            IndexerMinimal        `json:"indexer"`
+	FilterName                         string                `json:"filter"`
+	Protocol                           ReleaseProtocol       `json:"protocol"`
+	Implementation                     ReleaseImplementation `json:"implementation"` // irc, rss, api
+	Timestamp                          time.Time             `json:"timestamp"`
+	AnnounceType                       AnnounceType          `json:"announce_type"`
+	Type                               rls.Type              `json:"type"` // rls.Type
+	InfoURL                            string                `json:"info_url"`
+	DownloadURL                        string                `json:"download_url"`
+	MagnetURI                          string                `json:"-"`
+	GroupID                            string                `json:"group_id"`
+	TorrentID                          string                `json:"torrent_id"`
+	TorrentTmpFile                     string                `json:"-"`
+	TorrentDataRawBytes                []byte                `json:"-"`
+	TorrentHash                        string                `json:"-"`
+	TorrentName                        string                `json:"name"`            // full release name
+	NormalizedHash                     string                `json:"normalized_hash"` // normalized torrent name and md5 hashed
+	Size                               uint64                `json:"size"`
+	Title                              string                `json:"title"`     // Parsed title
+	SubTitle                           string                `json:"sub_title"` // Parsed secondary title for shows e.g. episode name
+	Description                        string                `json:"-"`
+	Category                           string                `json:"category"`
+	Categories                         []string              `json:"categories,omitempty"`
+	Season                             int                   `json:"season"`
+	Episode                            int                   `json:"episode"`
+	Year                               int                   `json:"year"`
+	Month                              int                   `json:"month"`
+	Day                                int                   `json:"day"`
+	Resolution                         string                `json:"resolution"`
+	Source                             string                `json:"source"`
+	Codec                              []string              `json:"codec"`
+	Container                          string                `json:"container"`
+	HDR                                []string              `json:"hdr"`
+	Audio                              []string              `json:"-"`
+	AudioChannels                      string                `json:"-"`
+	AudioFormat                        string                `json:"-"`
+	Bitrate                            string                `json:"-"`
+	Group                              string                `json:"group"`
+	Region                             string                `json:"-"`
+	Language                           []string              `json:"-"`
+	Proper                             bool                  `json:"proper"`
+	Repack                             bool                  `json:"repack"`
+	Website                            string                `json:"website"`
+	Hybrid                             bool                  `json:"hybrid"`
+	Edition                            []string              `json:"edition"`
+	Cut                                []string              `json:"cut"`
+	MediaProcessing                    string                `json:"media_processing"` // Remux, Encode, Untouched
+	Artists                            string                `json:"-"`
+	LogScore                           int                   `json:"-"`
+	HasCue                             bool                  `json:"-"`
+	HasLog                             bool                  `json:"-"`
+	Origin                             string                `json:"origin"` // P2P, Internal
+	Tags                               []string              `json:"-"`
+	ReleaseTags                        string                `json:"-"`
+	Freeleech                          bool                  `json:"-"`
+	FreeleechPercent                   int                   `json:"-"`
+	Bonus                              []string              `json:"-"`
+	Uploader                           string                `json:"uploader"`
+	RecordLabel                        string                `json:"record_label"`
+	PreTime                            string                `json:"pre_time"`
+	Other                              []string              `json:"-"`
+	RawCookie                          string                `json:"-"`
+	Seeders                            int                   `json:"-"`
+	Leechers                           int                   `json:"-"`
+	AdditionalSizeCheckRequired        bool                  `json:"-"`
+	AdditionalUploaderCheckRequired    bool                  `json:"-"`
+	AdditionalRecordLabelCheckRequired bool                  `json:"-"`
+	IsDuplicate                        bool                  `json:"-"`
+	SkipDuplicateProfileID             int64                 `json:"-"`
+	SkipDuplicateProfileName           string                `json:"-"`
+	FilterID                           int                   `json:"-"`
+	Filter                             *Filter               `json:"-"`
+	ActionStatus                       []ReleaseActionStatus `json:"action_status"`
+	MetaIMDB                           string                `json:"-"`
+}
+
+// Hash return md5 hashed normalized release name
+func (r *Release) Hash() string {
+	formatted := r.TorrentName
+
+	// for tv and movies we create the formatted title to have the best chance of matching
+	if r.IsTypeVideo() {
+		formatted = r.NormalizedTitle()
+	}
+
+	normalized := MustNormalize(formatted)
+	h := md5.Sum([]byte(normalized))
+	str := hex.EncodeToString(h[:])
+	return str
+}
+
+// MustNormalize applies the Normalize transform to s, returning a lower cased,
+// clean form of s useful for matching titles.
+func MustNormalize(s string) string {
+	s, _, err := transform.String(NewNormalizer(), s)
+	if err != nil {
+		panic(err)
+	}
+	return s
+}
+
+// NewNormalizer is a custom rls.Normalizer that keeps plus sign + for HDR10+ fx
+// It creates a new a text transformer chain (similiar to
+// NewCleaner) that normalizes text to lower case clean form useful for
+// matching titles.
+//
+// See: https://go.dev/blog/normalization
+func NewNormalizer() transform.Transformer {
+	return transform.Chain(
+		norm.NFD,
+		rls.NewCollapser(
+			true, true,
+			"`"+`':;~!@#%^*=()[]{}<>/?|\",`, " \t\r\n\f._",
+			func(r, prev, next rune) rune {
+				switch {
+				case r == '-' && unicode.IsSpace(prev):
+					return -1
+				case r == '$' && (unicode.IsLetter(prev) || unicode.IsLetter(next)):
+					return 'S'
+				case r == '£' && (unicode.IsLetter(prev) || unicode.IsLetter(next)):
+					return 'L'
+				case r == '$', r == '£':
+					return -1
+				}
+				return r
+			},
+		),
+		norm.NFC,
+	)
+}
+
+func (r *Release) NormalizedTitle() string {
+	var v []string
+
+	v = append(v, r.Title)
+
+	if r.Year > 0 && r.Month > 0 && r.Day > 0 {
+		v = append(v, fmt.Sprintf("%d %d %d", r.Year, r.Month, r.Day))
+	} else if r.Year > 0 {
+		v = append(v, fmt.Sprintf("%d", r.Year))
+	}
+
+	if len(r.Language) > 0 {
+		v = append(v, strings.Join(r.Language, " "))
+	}
+
+	if len(r.Cut) > 0 {
+		v = append(v, strings.Join(r.Cut, " "))
+	}
+
+	if len(r.Edition) > 0 {
+		v = append(v, strings.Join(r.Edition, " "))
+	}
+
+	if r.Season > 0 && r.Episode > 0 {
+		v = append(v, fmt.Sprintf("S%dE%d", r.Season, r.Episode))
+	} else if r.Season > 0 && r.Episode == 0 {
+		v = append(v, fmt.Sprintf("S%d", r.Season))
+	}
+
+	if r.Proper {
+		v = append(v, "PROPER")
+	}
+
+	if r.Repack {
+		v = append(v, r.RepackStr())
+	}
+
+	if r.Hybrid {
+		v = append(v, "HYBRiD")
+	}
+
+	if r.SubTitle != "" {
+		v = append(v, r.SubTitle)
+	}
+
+	if r.Resolution != "" {
+		v = append(v, r.Resolution)
+	}
+
+	if r.Website != "" {
+		v = append(v, r.Website)
+	}
+
+	if r.Region != "" {
+		v = append(v, r.Region)
+	}
+
+	if r.Source != "" {
+		v = append(v, r.Source)
+	}
+
+	// remux
+	if r.MediaProcessing == "REMUX" {
+		v = append(v, "REMUX")
+	}
+
+	if len(r.Codec) > 0 {
+		v = append(v, strings.Join(r.Codec, " "))
+	}
+
+	if len(r.HDR) > 0 {
+		v = append(v, strings.Join(r.HDR, " "))
+	}
+
+	if len(r.Audio) > 0 {
+		v = append(v, r.AudioString())
+	}
+
+	str := strings.Join(v, " ")
+
+	if r.Group != "" {
+		str = fmt.Sprintf("%s-%s", str, r.Group)
+	}
+
+	return str
+}
+
+func (r *Release) RepackStr() string {
+	if r.Other != nil {
+		if slices.Contains(r.Other, "REPACK") {
+			return "REPACK"
+		} else if slices.Contains(r.Other, "REREPACK") {
+			return "REREPACK"
+		} else if slices.Contains(r.Other, "REPACK2") {
+			return "REPACK2"
+		} else if slices.Contains(r.Other, "REPACK3") {
+			return "REPACK3"
+		}
+	}
+	return ""
+}
+
+func (r *Release) Raw(s string) rls.Release {
+	return rls.ParseString(s)
+}
+
+func (r *Release) ParseType(s string) {
+	r.Type = rls.ParseType(s)
+}
+
+func (r *Release) IsTypeVideo() bool {
+	return r.Type.Is(rls.Movie, rls.Series, rls.Episode)
+}
+
+type AnnounceType string
+
+const (
+	// AnnounceTypeNew Default announce type
+	AnnounceTypeNew AnnounceType = "NEW"
+	// AnnounceTypeChecked Checked release
+	AnnounceTypeChecked AnnounceType = "CHECKED"
+	// AnnounceTypePromo Marked as promotion (neutral/half/feeeleech etc.)
+	AnnounceTypePromo AnnounceType = "PROMO"
+	// AnnounceTypePromoGP Marked Golden Popcorn, PTP specific
+	AnnounceTypePromoGP AnnounceType = "PROMO_GP"
+	// AnnounceTypeResurrect Reseeded/revived from dead
+	AnnounceTypeResurrect AnnounceType = "RESURRECTED"
+)
+
+func (a AnnounceType) String() string {
+	switch a {
+	case AnnounceTypeNew:
+		return "NEW"
+	case AnnounceTypeChecked:
+		return "CHECKED"
+	case AnnounceTypePromo:
+		return "PROMO"
+	case AnnounceTypePromoGP:
+		return "PROMO_GP"
+	case AnnounceTypeResurrect:
+		return "RESURRECTED"
+	}
+
+	return ""
+}
+
+// ParseAnnounceType parse AnnounceType from string
+func ParseAnnounceType(s string) (AnnounceType, error) {
+	switch s {
+	case string(AnnounceTypeNew):
+		return AnnounceTypeNew, nil
+	case string(AnnounceTypeChecked):
+		return AnnounceTypeChecked, nil
+	case string(AnnounceTypePromo):
+		return AnnounceTypePromo, nil
+	case string(AnnounceTypePromoGP):
+		return AnnounceTypePromoGP, nil
+	case string(AnnounceTypeResurrect):
+		return AnnounceTypeResurrect, nil
+	default:
+		return "", fmt.Errorf("invalid AnnounceType: %s", s)
+	}
 }
 
 type ReleaseActionStatus struct {
 	ID         int64             `json:"id"`
 	Status     ReleasePushStatus `json:"status"`
 	Action     string            `json:"action"`
+	ActionID   int64             `json:"action_id"`
 	Type       ActionType        `json:"type"`
+	Client     string            `json:"client"`
+	Filter     string            `json:"filter"`
+	FilterID   int64             `json:"filter_id"`
 	Rejections []string          `json:"rejections"`
+	ReleaseID  int64             `json:"release_id"`
 	Timestamp  time.Time         `json:"timestamp"`
-	ReleaseID  int64             `json:"-"`
 }
 
-func NewRelease(indexer string, line string) (*Release, error) {
+type DeleteReleaseRequest struct {
+	OlderThan       int
+	Indexers        []string
+	ReleaseStatuses []string
+}
+
+func NewReleaseActionStatus(action *Action, release *Release) *ReleaseActionStatus {
+	s := &ReleaseActionStatus{
+		ID:         0,
+		Status:     ReleasePushStatusPending,
+		Action:     action.Name,
+		ActionID:   int64(action.ID),
+		Type:       action.Type,
+		Filter:     release.FilterName,
+		FilterID:   int64(release.FilterID),
+		Rejections: []string{},
+		Timestamp:  time.Now(),
+		ReleaseID:  release.ID,
+	}
+
+	if action.Client != nil {
+		s.Client = action.Client.Name
+	}
+
+	return s
+}
+
+type DownloadTorrentFileResponse struct {
+	MetaInfo    *metainfo.MetaInfo
+	TmpFileName string
+}
+
+type ReleaseStats struct {
+	TotalCount          int64 `json:"total_count"`
+	FilteredCount       int64 `json:"filtered_count"`
+	FilterRejectedCount int64 `json:"filter_rejected_count"`
+	PushApprovedCount   int64 `json:"push_approved_count"`
+	PushRejectedCount   int64 `json:"push_rejected_count"`
+	PushErrorCount      int64 `json:"push_error_count"`
+}
+
+type ReleasePushStatus string
+
+const (
+	ReleasePushStatusPending  ReleasePushStatus = "PENDING" // Initial status
+	ReleasePushStatusApproved ReleasePushStatus = "PUSH_APPROVED"
+	ReleasePushStatusRejected ReleasePushStatus = "PUSH_REJECTED"
+	ReleasePushStatusErr      ReleasePushStatus = "PUSH_ERROR"
+)
+
+func (r ReleasePushStatus) String() string {
+	switch r {
+	case ReleasePushStatusPending:
+		return "Pending"
+	case ReleasePushStatusApproved:
+		return "Approved"
+	case ReleasePushStatusRejected:
+		return "Rejected"
+	case ReleasePushStatusErr:
+		return "Error"
+	default:
+		return "Unknown"
+	}
+}
+
+func ValidReleasePushStatus(s string) bool {
+	switch s {
+	case string(ReleasePushStatusPending):
+		return true
+	case string(ReleasePushStatusApproved):
+		return true
+	case string(ReleasePushStatusRejected):
+		return true
+	case string(ReleasePushStatusErr):
+		return true
+	default:
+		return false
+	}
+}
+
+type ReleaseFilterStatus string
+
+const (
+	ReleaseStatusFilterApproved ReleaseFilterStatus = "FILTER_APPROVED"
+	ReleaseStatusFilterPending  ReleaseFilterStatus = "PENDING"
+
+	//ReleaseStatusFilterRejected ReleaseFilterStatus = "FILTER_REJECTED"
+)
+
+type ReleaseProtocol string
+
+const (
+	ReleaseProtocolTorrent ReleaseProtocol = "torrent"
+	ReleaseProtocolNzb     ReleaseProtocol = "usenet"
+)
+
+func (r ReleaseProtocol) String() string {
+	switch r {
+	case ReleaseProtocolTorrent:
+		return "torrent"
+	case ReleaseProtocolNzb:
+		return "usenet"
+	default:
+		return "torrent"
+	}
+}
+
+type ReleaseImplementation string
+
+const (
+	ReleaseImplementationIRC     ReleaseImplementation = "IRC"
+	ReleaseImplementationTorznab ReleaseImplementation = "TORZNAB"
+	ReleaseImplementationNewznab ReleaseImplementation = "NEWZNAB"
+	ReleaseImplementationRSS     ReleaseImplementation = "RSS"
+)
+
+func (r ReleaseImplementation) String() string {
+	switch r {
+	case ReleaseImplementationIRC:
+		return "IRC"
+	case ReleaseImplementationTorznab:
+		return "TORZNAB"
+	case ReleaseImplementationNewznab:
+		return "NEWZNAB"
+	case ReleaseImplementationRSS:
+		return "RSS"
+	default:
+		return "IRC"
+	}
+}
+
+type ReleaseQueryParams struct {
+	Limit   uint64
+	Offset  uint64
+	Cursor  uint64
+	Sort    map[string]string
+	Filters struct {
+		Indexers   []string
+		PushStatus string
+	}
+	Search string
+}
+
+type FindReleasesResponse struct {
+	Data       []*Release `json:"data"`
+	TotalCount uint64     `json:"count"`
+	NextCursor int64      `json:"next_cursor"`
+}
+
+type ReleaseActionRetryReq struct {
+	ReleaseId      int
+	ActionStatusId int
+	ActionId       int
+}
+
+type ReleaseProcessReq struct {
+	IndexerIdentifier     string   `json:"indexer_identifier"`
+	IndexerImplementation string   `json:"indexer_implementation"`
+	AnnounceLines         []string `json:"announce_lines"`
+}
+
+type GetReleaseRequest struct {
+	Id int
+}
+
+type GetReleaseActionStatusRequest struct {
+	Id int
+}
+
+func NewRelease(indexer IndexerMinimal) *Release {
 	r := &Release{
 		Indexer:        indexer,
-		Raw:            line,
 		FilterStatus:   ReleaseStatusFilterPending,
 		Rejections:     []string{},
 		Protocol:       ReleaseProtocolTorrent,
 		Implementation: ReleaseImplementationIRC,
 		Timestamp:      time.Now(),
-		Artists:        []string{},
 		Tags:           []string{},
+		Language:       []string{},
+		Edition:        []string{},
+		Cut:            []string{},
+		Other:          []string{},
+		Size:           0,
+		AnnounceType:   AnnounceTypeNew,
 	}
 
-	return r, nil
+	return r
 }
 
-func (r *Release) Parse() error {
-	var err error
+func (r *Release) ParseString(title string) {
+	rel := rls.ParseString(title)
 
-	err = r.extractYear()
-	err = r.extractSeason()
-	err = r.extractEpisode()
-	err = r.extractResolution()
-	err = r.extractSource()
-	err = r.extractCodec()
-	err = r.extractContainer()
-	err = r.extractHDR()
-	err = r.extractAudio()
-	err = r.extractGroup()
-	err = r.extractRegion()
-	err = r.extractLanguage()
-	err = r.extractEdition()
-	err = r.extractUnrated()
-	err = r.extractHybrid()
-	err = r.extractProper()
-	err = r.extractRepack()
-	err = r.extractWebsite()
-	err = r.extractReleaseTags()
+	r.Type = rel.Type
 
-	r.Clean = cleanReleaseName(r.TorrentName)
+	r.TorrentName = title
 
-	if err != nil {
-		log.Trace().Msgf("could not parse release: %v", r.TorrentName)
-		return err
+	r.Source = rel.Source
+	r.Resolution = rel.Resolution
+	r.Region = rel.Region
+
+	if rel.Language != nil {
+		r.Language = rel.Language
 	}
 
-	return nil
+	r.Audio = rel.Audio
+	r.AudioChannels = rel.Channels
+	r.Codec = rel.Codec
+	r.Container = rel.Container
+	r.HDR = rel.HDR
+	r.Artists = rel.Artist
+
+	if rel.Other != nil {
+		r.Other = rel.Other
+	}
+
+	r.Proper = slices.Contains(r.Other, "PROPER")
+	r.Repack = slices.Contains(r.Other, "REPACK") || slices.Contains(r.Other, "REREPACK")
+	r.Hybrid = slices.Contains(r.Other, "HYBRiD")
+
+	// TODO default to Encode and set Untouched for discs
+	if slices.Contains(r.Other, "REMUX") {
+		r.MediaProcessing = "REMUX"
+	}
+
+	if r.Title == "" {
+		r.Title = rel.Title
+	}
+	r.SubTitle = rel.Subtitle
+
+	if r.Season == 0 {
+		r.Season = rel.Series
+	}
+	if r.Episode == 0 {
+		r.Episode = rel.Episode
+	}
+
+	if r.Year == 0 {
+		r.Year = rel.Year
+	}
+	if r.Month == 0 {
+		r.Month = rel.Month
+	}
+	if r.Day == 0 {
+		r.Day = rel.Day
+	}
+
+	if r.Group == "" {
+		r.Group = rel.Group
+	}
+
+	if r.Website == "" {
+		r.Website = rel.Collection
+	}
+
+	if rel.Cut != nil {
+		r.Cut = rel.Cut
+	}
+
+	if rel.Edition != nil {
+		r.Edition = rel.Edition
+	}
+
+	r.ParseReleaseTagsString(r.ReleaseTags)
+	r.extraParseSource(rel)
+
+	r.NormalizedHash = r.Hash()
 }
 
-func (r *Release) extractYear() error {
-	if r.Year > 0 {
-		return nil
+func (r *Release) extraParseSource(rel rls.Release) {
+	if rel.Type != rls.Movie && rel.Type != rls.Series && rel.Type != rls.Episode {
+		return
 	}
 
-	y, err := findLastInt(r.TorrentName, `\b(((?:19[0-9]|20[0-9])[0-9]))\b`)
-	if err != nil {
-		return err
-	}
-	r.Year = y
-
-	return nil
-}
-
-func (r *Release) extractSeason() error {
-	s, err := findLastInt(r.TorrentName, `(?i)(?:S|Season\s*)(\d{1,3})`)
-	if err != nil {
-		return err
-	}
-	r.Season = s
-
-	return nil
-}
-
-func (r *Release) extractEpisode() error {
-	e, err := findLastInt(r.TorrentName, `(?i)[ex]([0-9]{2})(?:[^0-9]|$)`)
-	if err != nil {
-		return err
-	}
-	r.Episode = e
-
-	return nil
-}
-
-func (r *Release) extractResolution() error {
-	v, err := findLast(r.TorrentName, `\b(?i)[0-9]{3,4}(?:p|i)\b`)
-	if err != nil {
-		return err
-	}
-	r.Resolution = v
-
-	return nil
-}
-
-func (r *Release) extractResolutionFromTags(tag string) error {
-	if r.Resolution != "" {
-		return nil
-	}
-	v, err := findLast(tag, `\b(?i)(([0-9]{3,4}p|i))\b`)
-	if err != nil {
-		return err
-	}
-	r.Resolution = v
-
-	return nil
-}
-
-func (r *Release) extractSource() error {
-	v, err := findLast(r.TorrentName, `(?i)\b(((?:PPV\.)?[HP]DTV|(?:HD)?CAM|B[DR]Rip|(?:HD-?)?TS|(?:PPV )?WEB-?DL(?: DVDRip)?|HDRip|DVDRip|DVDRIP|CamRip|WEB|W[EB]BRip|Blu-?Ray|DvDScr|telesync|CD|DVD|Vinyl|DAT|Cassette))\b`)
-	if err != nil {
-		return err
-	}
-	r.Source = v
-
-	return nil
-}
-
-func (r *Release) extractSourceFromTags(tag string) error {
-	if r.Source != "" {
-		return nil
-	}
-	v, err := findLast(tag, `(?i)\b(((?:PPV\.)?[HP]DTV|(?:HD)?CAM|B[DR]Rip|(?:HD-?)?TS|(?:PPV )?WEB-?DL(?: DVDRip)?|HDRip|DVDRip|DVDRIP|CamRip|WEB|W[EB]BRip|Blu-?Ray|DvDScr|telesync|CD|DVD|Vinyl|DAT|Cassette))\b`)
-	if err != nil {
-		return err
-	}
-	r.Source = v
-
-	return nil
-}
-
-func (r *Release) extractCodec() error {
-	v, err := findLast(r.TorrentName, `(?i)\b(HEVC|[hx]\.?26[45] 10-bit|[hx]\.?26[45]|xvid|divx|AVC|MPEG-?2|AV1|VC-?1|VP9|WebP)\b`)
-	if err != nil {
-		return err
-	}
-	r.Codec = v
-
-	return nil
-}
-
-func (r *Release) extractCodecFromTags(tag string) error {
-	if r.Codec != "" {
-		return nil
+	tags := rel.Tags()
+	if len(tags) < 3 {
+		return
 	}
 
-	v, err := findLast(tag, `(?i)\b(HEVC|[hx]\.?26[45] 10-bit|[hx]\.?26[45]|xvid|divx|AVC|MPEG-?2|AV1|VC-?1|VP9|WebP)\b`)
-	if err != nil {
-		return err
-	}
-	r.Codec = v
+	// handle special cases like -VHS
+	if r.Group == "" {
+		// check the next to last item separator to be - or whitespace then check the next and use as group if empty
+		//if tags[len(tags)-1].TagType() == rls.TagTypeSource && (tags[len(tags)-2].TagType() == rls.TagTypeDelim && (tags[len(tags)-2].Delim() == "-" || tags[len(tags)-2].Delim() == " ")) {
+		lastItem := tags[len(tags)-1]
+		if lastItem.TagType() == rls.TagTypeSource && lastItem.Prev() == rls.TagTypeWhitespace {
+			group := lastItem.Text()
 
-	return nil
-}
-
-func (r *Release) extractContainer() error {
-	v, err := findLast(r.TorrentName, `(?i)\b(AVI|MPG|MKV|MP4|VOB|m2ts|ISO|IMG)\b`)
-	if err != nil {
-		return err
-	}
-	r.Container = v
-
-	return nil
-}
-
-func (r *Release) extractContainerFromTags(tag string) error {
-	if r.Container != "" {
-		return nil
-	}
-
-	v, err := findLast(tag, `(?i)\b(AVI|MPG|MKV|MP4|VOB|m2ts|ISO|IMG)\b`)
-	if err != nil {
-		return err
-	}
-	r.Container = v
-
-	return nil
-}
-
-func (r *Release) extractHDR() error {
-	v, err := findLast(r.TorrentName, `(?i)[\. ](HDR10\+|HDR10|DoVi[\. ]HDR|DV[\. ]HDR10\+|DV[\. ]HDR10|DV[\. ]HDR|HDR|DV|DoVi|Dolby[\. ]Vision[\. ]\+[\. ]HDR10|Dolby[\. ]Vision)[\. ]`)
-	if err != nil {
-		return err
-	}
-	r.HDR = v
-
-	return nil
-}
-
-func (r *Release) extractAudio() error {
-	v, err := findLast(r.TorrentName, `(?i)(FLAC[\. ][1-7][\. ][0-2]|FLAC|Opus|DD-EX|DDP[\. ]?[124567][\. ][012] Atmos|DDP[\. ]?[124567][\. ][012]|DDP|DD[1-7][\. ][0-2]|Dual[\- ]Audio|LiNE|PCM|Dolby TrueHD [0-9][\. ][0-4]|TrueHD [0-9][\. ][0-4] Atmos|TrueHD [0-9][\. ][0-4]|DTS X|DTS-HD MA [0-9][\. ][0-4]|DTS-HD MA|DTS-ES|DTS [1-7][\. ][0-2]|DTS|DD|DD[12][\. ]0|Dolby Atmos|TrueHD ATMOS|TrueHD|Atmos|Dolby Digital Plus|Dolby Digital Audio|Dolby Digital|AAC[.-]LC|AAC (?:\.?[1-7]\.[0-2])?|AAC|eac3|AC3(?:\.5\.1)?)`)
-	if err != nil {
-		return err
-	}
-	r.Audio = v
-
-	return nil
-}
-
-func (r *Release) extractAudioFromTags(tag string) error {
-	if r.Audio != "" {
-		return nil
-	}
-
-	v, err := findLast(tag, `(?i)(FLAC[\. ][1-7][\. ][0-2]|FLAC|Opus|DD-EX|DDP[\. ]?[124567][\. ][012] Atmos|DDP[\. ]?[124567][\. ][012]|DDP|DD[1-7][\. ][0-2]|Dual[\- ]Audio|LiNE|PCM|Dolby TrueHD [0-9][\. ][0-4]|TrueHD [0-9][\. ][0-4] Atmos|TrueHD [0-9][\. ][0-4]|DTS X|DTS-HD MA [0-9][\. ][0-4]|DTS-HD MA|DTS-ES|DTS [1-7][\. ][0-2]|DTS|DD|DD[12][\. ]0|Dolby Atmos|TrueHD ATMOS|TrueHD|Atmos|Dolby Digital Plus|Dolby Digital Audio|Dolby Digital|AAC[.-]LC|AAC (?:\.?[1-7]\.[0-2])?|AAC|eac3|AC3(?:\.5\.1)?)`)
-	if err != nil {
-		return err
-	}
-	r.Audio = v
-
-	return nil
-}
-
-func (r *Release) extractFormatsFromTags(tag string) error {
-	if r.Format != "" {
-		return nil
-	}
-
-	v, err := findLast(tag, `(?i)(?:MP3|FLAC|Ogg Vorbis|AAC|AC3|DTS)`)
-	if err != nil {
-		return err
-	}
-	r.Format = v
-
-	return nil
-}
-
-//func (r *Release) extractCueFromTags(tag string) error {
-//	v, err := findLast(tag, `Cue`)
-//	if err != nil {
-//		return err
-//	}
-//	r.HasCue = v
-//
-//	return nil
-//}
-
-func (r *Release) extractGroup() error {
-	// try first for wierd anime group names [group] show name, or in brackets at the end
-
-	//g, err := findLast(r.Clean, `\[(.*?)\]`)
-	group, err := findLast(r.TorrentName, `\-([a-zA-Z0-9_\.]+)$`)
-	if err != nil {
-		return err
-	}
-
-	r.Group = group
-
-	return nil
-}
-
-func (r *Release) extractAnimeGroupFromTags(tag string) error {
-	if r.Group != "" {
-		return nil
-	}
-	v, err := findLast(tag, `(?:RAW|Softsubs|Hardsubs)\s\((.+)\)`)
-	if err != nil {
-		return err
-	}
-	r.Group = v
-
-	return nil
-}
-
-func (r *Release) extractRegion() error {
-	v, err := findLast(r.TorrentName, `(?i)\b(R([0-9]))\b`)
-	if err != nil {
-		return err
-	}
-	r.Region = v
-
-	return nil
-}
-
-func (r *Release) extractLanguage() error {
-	v, err := findLast(r.TorrentName, `(?i)\b((DK|DKSUBS|DANiSH|DUTCH|NL|NLSUBBED|ENG|FI|FLEMiSH|FiNNiSH|DE|FRENCH|GERMAN|HE|HEBREW|HebSub|HiNDi|iCELANDiC|KOR|MULTi|MULTiSUBS|NORWEGiAN|NO|NORDiC|PL|PO|POLiSH|PLDUB|RO|ROMANiAN|RUS|SPANiSH|SE|SWEDiSH|SWESUB||))\b`)
-	if err != nil {
-		return err
-	}
-	r.Language = v
-
-	return nil
-}
-
-func (r *Release) extractEdition() error {
-	v, err := findLast(r.TorrentName, `(?i)\b((?:DIRECTOR'?S|EXTENDED|INTERNATIONAL|THEATRICAL|ORIGINAL|FINAL|BOOTLEG)(?:.CUT)?)\b`)
-	if err != nil {
-		return err
-	}
-	r.Edition = v
-
-	return nil
-}
-
-func (r *Release) extractUnrated() error {
-	v, err := findLastBool(r.TorrentName, `(?i)\b((UNRATED))\b`)
-	if err != nil {
-		return err
-	}
-	r.Unrated = v
-
-	return nil
-}
-
-func (r *Release) extractHybrid() error {
-	v, err := findLastBool(r.TorrentName, `(?i)\b((HYBRID))\b`)
-	if err != nil {
-		return err
-	}
-	r.Hybrid = v
-
-	return nil
-}
-
-func (r *Release) extractProper() error {
-	v, err := findLastBool(r.TorrentName, `(?i)\b((PROPER))\b`)
-	if err != nil {
-		return err
-	}
-	r.Proper = v
-
-	return nil
-}
-
-func (r *Release) extractRepack() error {
-	v, err := findLastBool(r.TorrentName, `(?i)\b((REPACK))\b`)
-	if err != nil {
-		return err
-	}
-	r.Repack = v
-
-	return nil
-}
-
-func (r *Release) extractWebsite() error {
-	// Start with the basic most common ones
-	v, err := findLast(r.TorrentName, `(?i)\b((AMBC|AS|AMZN|AMC|ANPL|ATVP|iP|CORE|BCORE|CMOR|CN|CBC|CBS|CMAX|CNBC|CC|CRIT|CR|CSPN|CW|DAZN|DCU|DISC|DSCP|DSNY|DSNP|DPLY|ESPN|FOX|FUNI|PLAY|HBO|HMAX|HIST|HS|HOTSTAR|HULU|iT|MNBC|MTV|NATG|NBC|NF|NICK|NRK|PMNT|PMNP|PCOK|PBS|PBSK|PSN|QIBI|SBS|SHO|STAN|STZ|SVT|SYFY|TLC|TRVL|TUBI|TV3|TV4|TVL|VH1|VICE|VMEO|UFC|USAN|VIAP|VIAPLAY|VL|WWEN|XBOX|YHOO|YT|RED))\b`)
-	if err != nil {
-		return err
-	}
-	r.Website = v
-
-	return nil
-}
-
-func (r *Release) extractFreeleechFromTags(tag string) error {
-	if r.Freeleech == true {
-		return nil
-	}
-
-	// Start with the basic most common ones
-	v, err := findLast(tag, `(?i)(Freeleech!|Freeleech)`)
-	if err != nil {
-		return err
-	}
-	if v != "" {
-		r.Freeleech = true
-		return nil
-	}
-
-	r.Freeleech = false
-
-	return nil
-}
-
-func (r *Release) extractLogScoreFromTags(tag string) error {
-	if r.LogScore > 0 {
-		return nil
-	}
-
-	// Start with the basic most common ones
-
-	rxp, err := regexp.Compile(`([\d\.]+)%`)
-	if err != nil {
-		return err
-		//return errors.Wrapf(err, "invalid regex: %s", value)
-	}
-
-	matches := rxp.FindStringSubmatch(tag)
-	if matches != nil {
-		// first value is the match, second value is the text
-		if len(matches) >= 1 {
-			last := matches[len(matches)-1]
-			score, err := strconv.ParseInt(last, 10, 32)
-			if err != nil {
-				return err
+			// handle special cases like -VHS
+			if r.Source == group {
+				r.Source = ""
 			}
 
-			r.LogScore = int(score)
-			return nil
+			r.Group = group
 		}
 	}
 
-	return nil
-}
-
-func (r *Release) extractQualityFromTags(tag string) error {
-	if r.Quality != "" {
-		return nil
+	if basicContainsSlice(r.Source, []string{"WEB-DL", "BluRay", "UHD.BluRay"}) {
+		return
 	}
 
-	// Start with the basic most common ones
+	// check res to be 1080p or 2160p and codec to be AVC, HEVC or if other contains Remux, then set source to BluRay if it differs
+	if !basicContainsSlice(r.Source, []string{"WEB-DL", "BluRay", "UHD.BluRay"}) && basicContainsSlice(r.Resolution, []string{"1080p", "2160p"}) && basicContainsMatch(r.Codec, []string{"AVC", "H.264", "H.265", "HEVC"}) && basicContainsMatch(r.Other, []string{"REMUX"}) {
+		// handle missing or unexpected source for some bluray releases
+		if r.Resolution == "1080p" {
+			r.Source = "BluRay"
 
-	rxp, err := regexp.Compile(`(?i)(Lossless|24bit Lossless|V0 \(VBR\)|V1 \(VBR\)|V2 \(VBR\)|APS \(VBR\)|APX \(VBR\)|320|256|192)`)
+		} else if r.Resolution == "2160p" {
+			r.Source = "UHD.BluRay"
+		}
+	}
+}
+
+func (r *Release) ParseReleaseTagsString(tags string) {
+	if tags == "" {
+		return
+	}
+
+	cleanTags := CleanReleaseTags(tags)
+	t := ParseReleaseTagString(cleanTags)
+
+	if len(t.Audio) > 0 {
+		//r.Audio = getUniqueTags(r.Audio, t.Audio)
+		r.Audio = t.Audio
+	}
+
+	if t.AudioBitrate != "" {
+		r.Bitrate = t.AudioBitrate
+	}
+
+	if t.AudioFormat != "" {
+		r.AudioFormat = t.AudioFormat
+	}
+
+	if r.AudioChannels == "" && t.Channels != "" {
+		r.AudioChannels = t.Channels
+	}
+
+	if t.HasLog {
+		r.HasLog = true
+
+		if t.LogScore > 0 {
+			r.LogScore = t.LogScore
+		}
+	}
+
+	if t.HasCue {
+		r.HasCue = true
+	}
+
+	if len(t.Bonus) > 0 {
+		if sliceContainsSlice([]string{"Freeleech", "Freeleech!"}, t.Bonus) {
+			r.Freeleech = true
+		}
+		// TODO handle percent and other types
+
+		r.Bonus = append(r.Bonus, t.Bonus...)
+	}
+	if len(t.Codec) > 0 {
+		r.Codec = getUniqueTags(r.Codec, append(make([]string, 0, 1), t.Codec))
+	}
+	if len(t.Other) > 0 {
+		r.Other = getUniqueTags(r.Other, t.Other)
+	}
+	if r.Origin == "" && t.Origin != "" {
+		r.Origin = t.Origin
+	}
+	if r.Container == "" && t.Container != "" {
+		r.Container = t.Container
+	}
+	if r.Resolution == "" && t.Resolution != "" {
+		r.Resolution = t.Resolution
+	}
+	if r.Source == "" && t.Source != "" {
+		r.Source = t.Source
+	}
+}
+
+// ParseSizeBytesString If there are parsing errors, then it keeps the original (or default size 0)
+// Otherwise, it will update the size only if the new size is bigger than the previous one.
+func (r *Release) ParseSizeBytesString(size string) {
+	s, err := humanize.ParseBytes(size)
+	if err == nil && s > r.Size {
+		r.Size = s
+	}
+}
+
+func (r *Release) OpenTorrentFile() error {
+	tmpFile, err := os.ReadFile(r.TorrentTmpFile)
 	if err != nil {
-		return err
-		//return errors.Wrapf(err, "invalid regex: %s", value)
+		return errors.Wrap(err, "could not read torrent file: %v", r.TorrentTmpFile)
 	}
 
-	matches := rxp.FindStringSubmatch(tag)
-	if matches != nil {
-		// first value is the match, second value is the text
-		if len(matches) >= 1 {
-			last := matches[len(matches)-1]
-
-			r.Quality = last
-			return nil
-		}
-	}
+	r.TorrentDataRawBytes = tmpFile
 
 	return nil
 }
 
-func (r *Release) extractReleaseTags() error {
-	if r.ReleaseTags == "" {
-		return nil
+// AudioString takes r.Audio and r.AudioChannels and returns a string like "DDP Atmos 5.1"
+func (r *Release) AudioString() string {
+	var audio []string
+
+	audio = append(audio, r.Audio...)
+	audio = append(audio, r.AudioChannels)
+
+	if len(audio) > 0 {
+		return strings.Join(audio, " ")
 	}
 
-	tags := SplitAny(r.ReleaseTags, ",|/")
-
-	for _, t := range tags {
-		t = strings.Trim(t, " ")
-
-		var err error
-		err = r.extractAudioFromTags(t)
-		err = r.extractFormatsFromTags(t)
-		err = r.extractResolutionFromTags(t)
-		err = r.extractCodecFromTags(t)
-		err = r.extractContainerFromTags(t)
-		err = r.extractSourceFromTags(t)
-		err = r.extractFreeleechFromTags(t)
-		err = r.extractLogScoreFromTags(t)
-		err = r.extractQualityFromTags(t)
-		err = r.extractAnimeGroupFromTags(t)
-
-		if err != nil {
-			continue
-		}
-
-		switch t {
-		case "Cue":
-			r.HasCue = true
-		case "Log":
-			r.HasLog = true
-			// check percent
-		}
-	}
-
-	return nil
+	return ""
 }
 
-func (r *Release) ParseTorrentUrl(match string, vars map[string]string, extraVars map[string]string, encode []string) error {
-	tmpVars := map[string]string{}
-
-	// copy vars to new tmp map
-	for k, v := range vars {
-		tmpVars[k] = v
-	}
-
-	// merge extra vars with vars
-	if extraVars != nil {
-		for k, v := range extraVars {
-			tmpVars[k] = v
-		}
-	}
-
-	// handle url encode of values
-	if encode != nil {
-		for _, e := range encode {
-			if v, ok := tmpVars[e]; ok {
-				// url encode  value
-				t := url.QueryEscape(v)
-				tmpVars[e] = t
-			}
-		}
-	}
-
-	// setup text template to inject variables into
-	tmpl, err := template.New("torrenturl").Parse(match)
-	if err != nil {
-		log.Error().Err(err).Msg("could not create torrent url template")
-		return err
-	}
-
-	var urlBytes bytes.Buffer
-	err = tmpl.Execute(&urlBytes, &tmpVars)
-	if err != nil {
-		log.Error().Err(err).Msg("could not write torrent url template output")
-		return err
-	}
-
-	r.TorrentURL = urlBytes.String()
-
-	// handle cookies
-	if v, ok := extraVars["cookie"]; ok {
-		r.RawCookie = v
-	}
-
-	return nil
+func (r *Release) DownloadTorrentFileCtx(ctx context.Context) error {
+	return r.downloadTorrentFile(ctx)
 }
 
-func (r *Release) DownloadTorrentFile() error {
-	if r.TorrentURL == "" {
+func (r *Release) downloadTorrentFile(ctx context.Context) error {
+	if r.HasMagnetUri() {
+		return errors.New("downloading magnet links is not supported: %s", r.MagnetURI)
+	} else if r.Protocol != ReleaseProtocolTorrent {
+		return errors.New("could not download file: protocol %s is not supported", r.Protocol)
+	}
+
+	if r.DownloadURL == "" {
 		return errors.New("download_file: url can't be empty")
 	} else if r.TorrentTmpFile != "" {
 		// already downloaded
 		return nil
 	}
 
-	jar, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.DownloadURL, nil)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "error downloading file")
 	}
 
-	customTransport := http.DefaultTransport.(*http.Transport).Clone()
-	customTransport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-	client := &http.Client{
-		Transport: customTransport,
-		Jar:       jar,
-	}
+	req.Header.Set("User-Agent", "autobrr")
 
-	req, err := http.NewRequest("GET", r.TorrentURL, nil)
-	if err != nil {
-		log.Error().Stack().Err(err).Msg("error downloading file")
-		return err
+	client := http.Client{
+		Timeout:   time.Second * 60,
+		Transport: sharedhttp.TransportTLSInsecure,
 	}
 
 	if r.RawCookie != "" {
+		jar, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
+		if err != nil {
+			return errors.Wrap(err, "could not create cookiejar")
+		}
+		client.Jar = jar
+
 		// set the cookie on the header instead of req.AddCookie
 		// since we have a raw cookie like "uid=10; pass=000"
 		req.Header.Set("Cookie", r.RawCookie)
 	}
 
-	// Get the data
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Error().Stack().Err(err).Msg("error downloading file")
-		return err
-	}
-	defer resp.Body.Close()
-
-	// retry logic
-
-	if resp.StatusCode != http.StatusOK {
-		log.Error().Stack().Err(err).Msgf("error downloading file from: %v - bad status: %d", r.TorrentURL, resp.StatusCode)
-		return fmt.Errorf("error downloading torrent (%v) file (%v) from '%v' - status code: %d", r.TorrentName, r.TorrentURL, r.Indexer, resp.StatusCode)
-	}
+	tmpFilePattern := "autobrr-"
+	tmpDir := os.TempDir()
 
 	// Create tmp file
-	tmpFile, err := os.CreateTemp("", "autobrr-")
+	tmpFile, err := os.CreateTemp(tmpDir, tmpFilePattern)
 	if err != nil {
-		log.Error().Stack().Err(err).Msg("error creating temp file")
-		return err
+		// inverse the err check to make it a bit cleaner
+		if !errors.Is(err, os.ErrNotExist) {
+			return errors.Wrap(err, "error creating tmp file")
+		}
+
+		if mkdirErr := os.MkdirAll(tmpDir, os.ModePerm); mkdirErr != nil {
+			return errors.Wrap(mkdirErr, "could not create TMP dir: %s", tmpDir)
+		}
+
+		tmpFile, err = os.CreateTemp(tmpDir, tmpFilePattern)
+		if err != nil {
+			return errors.Wrap(err, "error creating tmp file in: %s", tmpDir)
+		}
 	}
 	defer tmpFile.Close()
 
-	// Write the body to file
-	_, err = io.Copy(tmpFile, resp.Body)
-	if err != nil {
-		log.Error().Stack().Err(err).Msgf("error writing downloaded file: %v", tmpFile.Name())
-		return err
-	}
-
-	meta, err := metainfo.LoadFromFile(tmpFile.Name())
-	if err != nil {
-		log.Error().Stack().Err(err).Msgf("metainfo could not load file contents: %v", tmpFile.Name())
-		return err
-	}
-
-	torrentMetaInfo, err := meta.UnmarshalInfo()
-	if err != nil {
-		log.Error().Stack().Err(err).Msgf("metainfo could not unmarshal info from torrent: %v", tmpFile.Name())
-		return err
-	}
-
-	r.TorrentTmpFile = tmpFile.Name()
-	r.TorrentHash = meta.HashInfoBytes().String()
-	r.Size = uint64(torrentMetaInfo.TotalLength())
-
-	// remove file if fail
-
-	log.Debug().Msgf("successfully downloaded file: %v", tmpFile.Name())
-
-	return nil
-}
-
-func (r *Release) addRejection(reason string) {
-	r.Rejections = append(r.Rejections, reason)
-}
-
-func (r *Release) addRejectionF(format string, v ...interface{}) {
-	r.Rejections = append(r.Rejections, fmt.Sprintf(format, v...))
-}
-
-// ResetRejections reset rejections between filter checks
-func (r *Release) resetRejections() {
-	r.Rejections = []string{}
-}
-
-func (r *Release) RejectionsString() string {
-	if len(r.Rejections) > 0 {
-		return strings.Join(r.Rejections, ", ")
-	}
-	return ""
-}
-
-func (r *Release) CheckFilter(filter Filter) ([]string, bool) {
-	// reset rejections first to clean previous checks
-	r.resetRejections()
-
-	if !filter.Enabled {
-		return nil, false
-	}
-
-	// FIXME what if someone explicitly doesnt want scene, or toggles in filter. Make enum? 0,1,2? Yes, No, Dont care
-	if filter.Scene && r.IsScene != filter.Scene {
-		r.addRejection("wanted: scene")
-	}
-
-	if filter.Freeleech && r.Freeleech != filter.Freeleech {
-		r.addRejection("wanted: freeleech")
-	}
-
-	if filter.FreeleechPercent != "" && !checkFreeleechPercent(r.FreeleechPercent, filter.FreeleechPercent) {
-		r.addRejectionF("freeleech percent not matching. wanted: %v got: %v", filter.FreeleechPercent, r.FreeleechPercent)
-	}
-
-	// check against TorrentName and Clean which is a cleaned name without (. _ -)
-	if filter.Shows != "" && !checkMultipleFilterStrings(filter.Shows, r.TorrentName, r.Clean) {
-		r.addRejection("shows not matching")
-	}
-
-	if filter.Seasons != "" && !checkFilterIntStrings(r.Season, filter.Seasons) {
-		r.addRejectionF("season not matching. wanted: %v got: %d", filter.Seasons, r.Season)
-	}
-
-	if filter.Episodes != "" && !checkFilterIntStrings(r.Episode, filter.Episodes) {
-		r.addRejectionF("episodes not matching. wanted: %v got: %d", filter.Seasons, r.Season)
-	}
-
-	// matchRelease
-	// TODO allow to match against regex
-	if filter.MatchReleases != "" && !checkMultipleFilterStrings(filter.MatchReleases, r.TorrentName, r.Clean) {
-		r.addRejection("match release not matching")
-	}
-
-	if filter.ExceptReleases != "" && checkMultipleFilterStrings(filter.ExceptReleases, r.TorrentName, r.Clean) {
-		r.addRejection("except_releases: unwanted release")
-	}
-
-	if filter.MatchReleaseGroups != "" && !checkMultipleFilterGroups(filter.MatchReleaseGroups, r.Group, r.Clean) {
-		r.addRejectionF("release groups not matching. wanted: %v got: %v", filter.MatchReleaseGroups, r.Group)
-	}
-
-	if filter.ExceptReleaseGroups != "" && checkMultipleFilterGroups(filter.ExceptReleaseGroups, r.Group, r.Clean) {
-		r.addRejectionF("unwanted release group. unwanted: %v got: %v", filter.ExceptReleaseGroups, r.Group)
-	}
-
-	if filter.MatchUploaders != "" && !checkFilterStrings(r.Uploader, filter.MatchUploaders) {
-		r.addRejectionF("uploaders not matching. wanted: %v got: %v", filter.MatchUploaders, r.Uploader)
-	}
-
-	if filter.ExceptUploaders != "" && checkFilterStrings(r.Uploader, filter.ExceptUploaders) {
-		r.addRejectionF("unwanted uploaders. unwanted: %v got: %v", filter.MatchUploaders, r.Uploader)
-	}
-
-	if len(filter.Resolutions) > 0 && !checkFilterSlice(r.Resolution, filter.Resolutions) {
-		r.addRejectionF("resolution not matching. wanted: %v got: %v", filter.Resolutions, r.Resolution)
-	}
-
-	if len(filter.Codecs) > 0 && !checkFilterSlice(r.Codec, filter.Codecs) {
-		r.addRejectionF("codec not matching. wanted: %v got: %v", filter.Codecs, r.Codec)
-	}
-
-	if len(filter.Sources) > 0 && !checkFilterSource(r.Source, filter.Sources) {
-		r.addRejectionF("source not matching. wanted: %v got: %v", filter.Sources, r.Source)
-	}
-
-	if len(filter.Containers) > 0 && !checkFilterSlice(r.Container, filter.Containers) {
-		r.addRejectionF("container not matching. wanted: %v got: %v", filter.Containers, r.Container)
-	}
-
-	if len(filter.MatchHDR) > 0 && !checkMultipleFilterHDR(filter.MatchHDR, r.HDR, r.TorrentName) {
-		r.addRejectionF("hdr not matching. wanted: %v got: %v", filter.MatchHDR, r.HDR)
-	}
-
-	if len(filter.ExceptHDR) > 0 && checkMultipleFilterHDR(filter.ExceptHDR, r.HDR, r.TorrentName) {
-		r.addRejectionF("hdr unwanted. unwanted: %v got: %v", filter.ExceptHDR, r.HDR)
-	}
-
-	if filter.Years != "" && !checkFilterIntStrings(r.Year, filter.Years) {
-		r.addRejectionF("year not matching. wanted: %v got: %d", filter.Years, r.Year)
-	}
-
-	if filter.MatchCategories != "" && !checkFilterStrings(r.Category, filter.MatchCategories) {
-		r.addRejectionF("category not matching. wanted: %v got: %v", filter.MatchCategories, r.Category)
-	}
-
-	if filter.ExceptCategories != "" && checkFilterStrings(r.Category, filter.ExceptCategories) {
-		r.addRejectionF("category unwanted. unwanted: %v got: %v", filter.ExceptCategories, r.Category)
-	}
-
-	if len(filter.MatchReleaseTypes) > 0 && !checkFilterSlice(r.Category, filter.MatchReleaseTypes) {
-		r.addRejectionF("release type not matching. wanted: %v got: %v", filter.MatchReleaseTypes, r.Category)
-	}
-
-	if (filter.MinSize != "" || filter.MaxSize != "") && !r.CheckSizeFilter(filter.MinSize, filter.MaxSize) {
-		r.addRejectionF("size not matching. wanted min: %v max: %v got: %v", filter.MinSize, filter.MaxSize, r.Size)
-	}
-
-	if filter.Tags != "" && !checkFilterTags(r.Tags, filter.Tags) {
-		r.addRejectionF("tags not matching. wanted: %v got: %v", filter.Tags, r.Tags)
-	}
-
-	if filter.ExceptTags != "" && checkFilterTags(r.Tags, filter.ExceptTags) {
-		r.addRejectionF("tags unwanted. wanted: %v got: %v", filter.ExceptTags, r.Tags)
-	}
-
-	if len(filter.Artists) > 0 && !checkFilterStrings(r.TorrentName, filter.Artists) {
-		r.addRejection("artists not matching")
-	}
-
-	if len(filter.Albums) > 0 && !checkFilterStrings(r.TorrentName, filter.Albums) {
-		r.addRejection("albums not matching")
-	}
-
-	// Perfect flac requires Cue, Log, Log Score 100, FLAC and 24bit Lossless
-	if filter.PerfectFlac {
-		if !r.HasLog || !r.HasCue || r.LogScore != 100 || r.Format != "FLAC" && !checkFilterSlice(r.Quality, []string{"Lossless", "24bit Lossless"}) {
-			r.addRejectionF("wanted: perfect flac. got: cue %v log %v log score %v format %v quality %v", r.HasCue, r.HasLog, r.LogScore, r.Format, r.Quality)
+	errFunc := retry.Do(func() error {
+		// Get the data
+		resp, err := client.Do(req)
+		if err != nil {
+			return errors.Wrap(err, "error downloading file")
 		}
-	}
+		defer resp.Body.Close()
 
-	if len(filter.Formats) > 0 && !checkFilterSlice(r.Format, filter.Formats) {
-		r.addRejectionF("formats not matching. wanted: %v got: %v", filter.Formats, r.Format)
-	}
+		// Check server response
+		switch resp.StatusCode {
+		case http.StatusOK:
+			// Continue processing the response
+		//case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		//	// Handle redirect
+		//	return retry.Unrecoverable(errors.New("redirect encountered for torrent (%s) file (%s) - status code: %d - check indexer keys for %s", r.TorrentName, r.DownloadURL, resp.StatusCode, r.Indexer.Name))
 
-	if len(filter.Quality) > 0 && !checkFilterSlice(r.Quality, filter.Quality) {
-		r.addRejectionF("quality not matching. wanted: %v got: %v", filter.Quality, r.Quality)
-	}
+		case http.StatusUnauthorized, http.StatusForbidden:
+			return retry.Unrecoverable(errors.New("unrecoverable error downloading torrent (%s) file (%s) - status code: %d - check indexer keys for %s", r.TorrentName, r.DownloadURL, resp.StatusCode, r.Indexer.Name))
 
-	if len(filter.Media) > 0 && !checkFilterSource(r.Source, filter.Media) {
-		r.addRejectionF("media not matching. wanted: %v got: %v", filter.Media, r.Source)
-	}
+		case http.StatusMethodNotAllowed:
+			return retry.Unrecoverable(errors.New("unrecoverable error downloading torrent (%s) file (%s) from '%s' - status code: %d. Check if the request method is correct", r.TorrentName, r.DownloadURL, r.Indexer.Name, resp.StatusCode))
+		case http.StatusNotFound:
+			return errors.New("torrent %s not found on %s (%d) - retrying", r.TorrentName, r.Indexer.Name, resp.StatusCode)
 
-	if filter.Log && r.HasLog != filter.Log {
-		r.addRejection("wanted: log")
-	}
+		case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			return errors.New("server error (%d) encountered while downloading torrent (%s) file (%s) from '%s' - retrying", resp.StatusCode, r.TorrentName, r.DownloadURL, r.Indexer.Name)
 
-	if filter.Log && filter.LogScore != 0 && r.LogScore != filter.LogScore {
-		r.addRejectionF("wanted: log score %v got: %v", filter.LogScore, r.LogScore)
-	}
+		case http.StatusInternalServerError:
+			return errors.New("server error (%d) encountered while downloading torrent (%s) file (%s) - check indexer keys for %s", resp.StatusCode, r.TorrentName, r.DownloadURL, r.Indexer.Name)
 
-	if filter.Cue && r.HasCue != filter.Cue {
-		r.addRejection("wanted: cue")
-	}
+		default:
+			return retry.Unrecoverable(errors.New("unexpected status code %d: check indexer keys for %s", resp.StatusCode, r.Indexer.Name))
+		}
 
-	if len(r.Rejections) > 0 {
-		return r.Rejections, false
-	}
+		resetTmpFile := func() {
+			tmpFile.Seek(0, io.SeekStart)
+			tmpFile.Truncate(0)
+		}
 
-	return nil, true
+		// Read the body into bytes
+		bodyBytes, err := io.ReadAll(bufio.NewReader(resp.Body))
+		if err != nil {
+			return errors.Wrap(err, "error reading response body")
+		}
+
+		// Create a new reader for bodyBytes
+		bodyReader := bytes.NewReader(bodyBytes)
+
+		// Try to decode as torrent file
+		meta, err := metainfo.Load(bodyReader)
+		if err != nil {
+			resetTmpFile()
+
+			// explicitly check for unexpected content type that match html
+			var bse *bencode.SyntaxError
+			if errors.As(err, &bse) {
+				// regular error so we can retry if we receive html first run
+				return errors.Wrap(err, "metainfo unexpected content type, got HTML expected a bencoded torrent. check indexer keys for %s - %s", r.Indexer.Name, r.TorrentName)
+			}
+
+			return retry.Unrecoverable(errors.Wrap(err, "metainfo unexpected content type. check indexer keys for %s - %s", r.Indexer.Name, r.TorrentName))
+		}
+
+		// Write the body to file
+		if _, err := tmpFile.Write(bodyBytes); err != nil {
+			resetTmpFile()
+			return errors.Wrap(err, "error writing downloaded file: %s", tmpFile.Name())
+		}
+
+		torrentMetaInfo, err := meta.UnmarshalInfo()
+		if err != nil {
+			resetTmpFile()
+			return retry.Unrecoverable(errors.Wrap(err, "metainfo could not unmarshal info from torrent: %s", tmpFile.Name()))
+		}
+
+		hashInfoBytes := meta.HashInfoBytes().Bytes()
+		if len(hashInfoBytes) < 1 {
+			resetTmpFile()
+			return retry.Unrecoverable(errors.New("could not read infohash"))
+		}
+
+		r.TorrentTmpFile = tmpFile.Name()
+		r.TorrentHash = meta.HashInfoBytes().String()
+		r.Size = uint64(torrentMetaInfo.TotalLength())
+
+		return nil
+	},
+		retry.Delay(time.Second*3),
+		retry.Attempts(3),
+		retry.MaxJitter(time.Second*1),
+	)
+
+	return errFunc
 }
 
-// CheckSizeFilter additional size check
-// for indexers that doesn't announce size, like some gazelle based
-// set flag r.AdditionalSizeCheckRequired if there's a size in the filter, otherwise go a head
-// implement API for ptp,btn,ggn to check for size if needed
-// for others pull down torrent and do check
-func (r *Release) CheckSizeFilter(minSize string, maxSize string) bool {
+func (r *Release) CleanupTemporaryFiles() {
+	if r.TorrentTmpFile == "" {
+		return
+	}
 
-	if r.Size == 0 {
-		r.AdditionalSizeCheckRequired = true
+	os.Remove(r.TorrentTmpFile)
+	r.TorrentTmpFile = ""
+}
 
+// HasMagnetUri check uf MagnetURI is set and valid or empty
+func (r *Release) HasMagnetUri() bool {
+	if r.MagnetURI != "" && strings.HasPrefix(r.MagnetURI, MagnetURIPrefix) {
 		return true
-	} else {
-		r.AdditionalSizeCheckRequired = false
 	}
-
-	// if r.Size parse filter to bytes and compare
-	// handle both min and max
-	if minSize != "" {
-		// string to bytes
-		minSizeBytes, err := humanize.ParseBytes(minSize)
-		if err != nil {
-			// log could not parse into bytes
-		}
-
-		if r.Size <= minSizeBytes {
-			r.addRejection("size: smaller than min size")
-			return false
-		}
-
-	}
-
-	if maxSize != "" {
-		// string to bytes
-		maxSizeBytes, err := humanize.ParseBytes(maxSize)
-		if err != nil {
-			// log could not parse into bytes
-		}
-
-		if r.Size >= maxSizeBytes {
-			r.addRejection("size: larger than max size")
-			return false
-		}
-	}
-
-	return true
+	return false
 }
 
-// MapVars better name
-func (r *Release) MapVars(def IndexerDefinition, varMap map[string]string) error {
+const MagnetURIPrefix = "magnet:?"
 
+// MapVars map vars from regex captures to fields on release
+func (r *Release) MapVars(def *IndexerDefinition, varMap map[string]string) error {
 	if torrentName, err := getStringMapValue(varMap, "torrentName"); err != nil {
 		return errors.Wrap(err, "failed parsing required field")
 	} else {
@@ -944,55 +972,182 @@ func (r *Release) MapVars(def IndexerDefinition, varMap map[string]string) error
 		r.Category = category
 	}
 
+	if announceType, err := getStringMapValue(varMap, "announceType"); err == nil {
+		annType, parseErr := ParseAnnounceType(announceType)
+		if parseErr == nil {
+			r.AnnounceType = annType
+		}
+	}
+
 	if freeleech, err := getStringMapValue(varMap, "freeleech"); err == nil {
-		r.Freeleech = strings.EqualFold(freeleech, "freeleech") || strings.EqualFold(freeleech, "yes") || strings.EqualFold(freeleech, "1")
+		fl := StringEqualFoldMulti(freeleech, "1", "fl", "free", "freeleech", "freeleech!", "yes", "VIP", "★")
+		if fl {
+			r.Freeleech = true
+			// default to 100 and override if freeleechPercent is present in next function
+			r.FreeleechPercent = 100
+			r.Bonus = append(r.Bonus, "Freeleech")
+		}
 	}
 
 	if freeleechPercent, err := getStringMapValue(varMap, "freeleechPercent"); err == nil {
+		// special handling for BHD to map their freeleech into percent
+		if def.Identifier == "beyondhd" {
+			if freeleechPercent == "Capped FL" {
+				freeleechPercent = "100%"
+			} else if strings.Contains(freeleechPercent, "% FL") {
+				freeleechPercent = strings.Replace(freeleechPercent, " FL", "", -1)
+			}
+		}
+
 		// remove % and trim spaces
 		freeleechPercent = strings.Replace(freeleechPercent, "%", "", -1)
 		freeleechPercent = strings.Trim(freeleechPercent, " ")
 
-		freeleechPercentInt, err := strconv.Atoi(freeleechPercent)
-		if err != nil {
-			//log.Debug().Msgf("bad freeleechPercent var: %v", year)
-		}
+		freeleechPercentInt, parseErr := strconv.Atoi(freeleechPercent)
+		if parseErr == nil {
+			if freeleechPercentInt > 0 {
+				r.Freeleech = true
+				r.FreeleechPercent = freeleechPercentInt
 
-		r.FreeleechPercent = freeleechPercentInt
+				r.Bonus = append(r.Bonus, "Freeleech")
+
+				switch freeleechPercentInt {
+				case 25:
+					r.Bonus = append(r.Bonus, "Freeleech25")
+				case 50:
+					r.Bonus = append(r.Bonus, "Freeleech50")
+				case 75:
+					r.Bonus = append(r.Bonus, "Freeleech75")
+				case 100:
+					r.Bonus = append(r.Bonus, "Freeleech100")
+				}
+			}
+		}
 	}
+
+	if downloadVolumeFactorVar, ok := varMap["downloadVolumeFactor"]; ok {
+		// special handling for BHD to map their freeleech into percent
+		//if def.Identifier == "beyondhd" {
+		//	if freeleechPercent == "Capped FL" {
+		//		freeleechPercent = "100%"
+		//	} else if strings.Contains(freeleechPercent, "% FL") {
+		//		freeleechPercent = strings.Replace(freeleechPercent, " FL", "", -1)
+		//	}
+		//}
+
+		//r.downloadVolumeFactor = downloadVolumeFactor
+
+		// Parse the value as decimal number
+		downloadVolumeFactor, parseErr := strconv.ParseFloat(downloadVolumeFactorVar, 64)
+		if parseErr == nil {
+			// Values below 0.0 and above 1.0 are rejected
+			if downloadVolumeFactor >= 0 || downloadVolumeFactor <= 1 {
+				// Multiply by 100 to convert from ratio to percentage and round it
+				// to the nearest integer value
+				downloadPercentage := math.Round(downloadVolumeFactor * 100)
+
+				// To convert from download percentage to freeleech percentage the
+				// value is inverted
+				r.FreeleechPercent = 100 - int(downloadPercentage)
+				if r.FreeleechPercent > 0 {
+					r.Freeleech = true
+				}
+			}
+		}
+	}
+
+	//if uploadVolumeFactor, err := getStringMapValue(varMap, "uploadVolumeFactor"); err == nil {
+	//	// special handling for BHD to map their freeleech into percent
+	//	//if def.Identifier == "beyondhd" {
+	//	//	if freeleechPercent == "Capped FL" {
+	//	//		freeleechPercent = "100%"
+	//	//	} else if strings.Contains(freeleechPercent, "% FL") {
+	//	//		freeleechPercent = strings.Replace(freeleechPercent, " FL", "", -1)
+	//	//	}
+	//	//}
+	//
+	//	r.uploadVolumeFactor = uploadVolumeFactor
+	//
+	//	//freeleechPercentInt, err := strconv.Atoi(freeleechPercent)
+	//	//if err != nil {
+	//	//	//log.Debug().Msgf("bad freeleechPercent var: %v", year)
+	//	//}
+	//	//
+	//	//if freeleechPercentInt > 0 {
+	//	//	r.Freeleech = true
+	//	//	r.FreeleechPercent = freeleechPercentInt
+	//	//}
+	//}
 
 	if uploader, err := getStringMapValue(varMap, "uploader"); err == nil {
 		r.Uploader = uploader
 	}
 
+	if recordLabel, err := getStringMapValue(varMap, "recordLabel"); err == nil {
+		r.RecordLabel = recordLabel
+	}
+
 	if torrentSize, err := getStringMapValue(varMap, "torrentSize"); err == nil {
+		// Some indexers like BTFiles announces size with comma. Humanize does not handle that well and strips it.
+		torrentSize = strings.Replace(torrentSize, ",", ".", 1)
+
 		// handling for indexer who doesn't explicitly set which size unit is used like (AR)
-		if def.Parse.ForceSizeUnit != "" {
-			torrentSize = fmt.Sprintf("%v %v", torrentSize, def.Parse.ForceSizeUnit)
+		if def.IRC != nil && def.IRC.Parse != nil && def.IRC.Parse.ForceSizeUnit != "" {
+			torrentSize = fmt.Sprintf("%s %s", torrentSize, def.IRC.Parse.ForceSizeUnit)
 		}
 
-		size, err := humanize.ParseBytes(torrentSize)
-		if err != nil {
-			// log could not parse into bytes
+		size, parseErr := humanize.ParseBytes(torrentSize)
+		if parseErr == nil {
+			r.Size = size
 		}
-		r.Size = size
+	}
+
+	if torrentSizeBytes, err := getStringMapValue(varMap, "torrentSizeBytes"); err == nil {
+		size, parseErr := strconv.ParseUint(torrentSizeBytes, 10, 64)
+		if parseErr == nil {
+			r.Size = size
+		}
 	}
 
 	if scene, err := getStringMapValue(varMap, "scene"); err == nil {
-		r.IsScene = strings.EqualFold(scene, "true") || strings.EqualFold(scene, "yes")
+		if StringEqualFoldMulti(scene, "true", "yes", "1") {
+			r.Origin = "SCENE"
+		}
+	}
+
+	// set origin. P2P, SCENE, O-SCENE and Internal
+	if origin, err := getStringMapValue(varMap, "origin"); err == nil {
+		r.Origin = origin
+	}
+
+	if internal, err := getStringMapValue(varMap, "internal"); err == nil {
+		if StringEqualFoldMulti(internal, "internal", "yes", "1") {
+			r.Origin = "INTERNAL"
+		}
 	}
 
 	if yearVal, err := getStringMapValue(varMap, "year"); err == nil {
-		year, err := strconv.Atoi(yearVal)
-		if err != nil {
-			//log.Debug().Msgf("bad year var: %v", year)
+		year, parseErr := strconv.Atoi(yearVal)
+		if parseErr == nil {
+			r.Year = year
 		}
-		r.Year = year
 	}
 
 	if tags, err := getStringMapValue(varMap, "tags"); err == nil {
-		tagArr := strings.Split(strings.ReplaceAll(tags, " ", ""), ",")
-		r.Tags = tagArr
+		if tags != "" && tags != "*" {
+			tagsArr := []string{}
+			s := strings.Split(tags, ",")
+			for _, t := range s {
+				tagsArr = append(tagsArr, strings.Trim(t, " "))
+			}
+			r.Tags = tagsArr
+		}
+	}
+
+	if title, err := getStringMapValue(varMap, "title"); err == nil {
+		if title != "" && title != "*" {
+			r.Title = title
+		}
 	}
 
 	// handle releaseTags. Most of them are redundant but some are useful
@@ -1004,303 +1159,24 @@ func (r *Release) MapVars(def IndexerDefinition, varMap map[string]string) error
 		r.Resolution = resolution
 	}
 
+	if releaseGroup, err := getStringMapValue(varMap, "releaseGroup"); err == nil {
+		r.Group = releaseGroup
+	}
+
+	if episodeVal, err := getStringMapValue(varMap, "releaseEpisode"); err == nil {
+		episode, _ := strconv.Atoi(episodeVal)
+		r.Episode = episode
+	}
+
+	if metaImdb, err := getStringMapValue(varMap, "imdb"); err == nil {
+		r.MetaIMDB = metaImdb
+	}
+
 	return nil
-}
-
-func checkFilterSlice(name string, filterList []string) bool {
-	name = strings.ToLower(name)
-
-	for _, filter := range filterList {
-		filter = strings.ToLower(filter)
-		filter = strings.Trim(filter, " ")
-		// check if line contains * or ?, if so try wildcard match, otherwise try substring match
-		a := strings.ContainsAny(filter, "?|*")
-		if a {
-			match := wildcard.Match(filter, name)
-			if match {
-				return true
-			}
-		} else {
-			b := strings.Contains(name, filter)
-			if b {
-				return true
-			}
-		}
-	}
-
-	return false
-}
-
-func checkFilterStrings(name string, filterList string) bool {
-	filterSplit := strings.Split(filterList, ",")
-	name = strings.ToLower(name)
-
-	for _, s := range filterSplit {
-		s = strings.ToLower(s)
-		s = strings.Trim(s, " ")
-		// check if line contains * or ?, if so try wildcard match, otherwise try substring match
-		a := strings.ContainsAny(s, "?|*")
-		if a {
-			match := wildcard.Match(s, name)
-			if match {
-				return true
-			}
-		} else {
-			b := strings.Contains(name, s)
-			if b {
-				return true
-			}
-		}
-
-	}
-
-	return false
-}
-
-// checkMultipleFilterStrings check against multiple vars of unknown length
-func checkMultipleFilterStrings(filterList string, vars ...string) bool {
-	filterSplit := strings.Split(filterList, ",")
-
-	for _, name := range vars {
-		name = strings.ToLower(name)
-
-		for _, s := range filterSplit {
-			s = strings.ToLower(s)
-			s = strings.Trim(s, " ")
-			// check if line contains * or ?, if so try wildcard match, otherwise try substring match
-			a := strings.ContainsAny(s, "?|*")
-			if a {
-				match := wildcard.Match(s, name)
-				if match {
-					return true
-				}
-			} else {
-				b := strings.Contains(name, s)
-				if b {
-					return true
-				}
-			}
-		}
-	}
-
-	return false
-}
-
-// checkFilterIntStrings "1,2,3-20"
-func checkFilterIntStrings(value int, filterList string) bool {
-	filters := strings.Split(filterList, ",")
-
-	for _, s := range filters {
-		s = strings.Replace(s, "%", "", -1)
-		s = strings.Trim(s, " ")
-
-		if strings.Contains(s, "-") {
-			minMax := strings.Split(s, "-")
-
-			// to int
-			min, err := strconv.ParseInt(minMax[0], 10, 32)
-			if err != nil {
-				return false
-			}
-
-			max, err := strconv.ParseInt(minMax[1], 10, 32)
-			if err != nil {
-				return false
-			}
-
-			if min > max {
-				// handle error
-				return false
-			} else {
-				// if announcePercent is greater than min and less than max return true
-				if value >= int(min) && value <= int(max) {
-					return true
-				}
-			}
-		}
-
-		filterInt, err := strconv.ParseInt(s, 10, 32)
-		if err != nil {
-			return false
-		}
-
-		if int(filterInt) == value {
-			return true
-		}
-	}
-
-	return false
-}
-
-func checkMultipleFilterGroups(filterList string, vars ...string) bool {
-	filterSplit := strings.Split(filterList, ",")
-
-	for _, name := range vars {
-		name = strings.ToLower(name)
-
-		for _, s := range filterSplit {
-			s = strings.ToLower(strings.Trim(s, " "))
-			// check if line contains * or ?, if so try wildcard match, otherwise try substring match
-			a := strings.ContainsAny(s, "?|*")
-			if a {
-				match := wildcard.Match(s, name)
-				if match {
-					return true
-				}
-			} else {
-				split := SplitAny(name, " .-")
-				for _, c := range split {
-					if c == s {
-						return true
-					}
-				}
-				continue
-			}
-		}
-	}
-
-	return false
-}
-
-func checkMultipleFilterHDR(filterList []string, vars ...string) bool {
-	for _, name := range vars {
-		name = strings.ToLower(name)
-
-		for _, s := range filterList {
-			s = strings.ToLower(strings.Trim(s, " "))
-			// check if line contains * or ?, if so try wildcard match, otherwise try substring match
-			a := strings.ContainsAny(s, "?|*")
-			if a {
-				match := wildcard.Match(s, name)
-				if match {
-					return true
-				}
-			} else {
-				split := SplitAny(name, " .-")
-				for _, c := range split {
-					if c == s {
-						return true
-					}
-				}
-				continue
-			}
-		}
-	}
-
-	return false
-}
-
-func checkFilterSource(name string, filterList []string) bool {
-	// remove dash (-) in blu-ray web-dl and make lowercase
-	name = strings.ToLower(strings.ReplaceAll(name, "-", ""))
-
-	for _, filter := range filterList {
-		// remove dash (-) in blu-ray web-dl, trim spaces and make lowercase
-		filter = strings.ToLower(strings.Trim(strings.ReplaceAll(filter, "-", ""), " "))
-
-		b := strings.Contains(name, filter)
-		if b {
-			return true
-		}
-	}
-
-	return false
-}
-
-func checkFilterTags(tags []string, filter string) bool {
-	filterTags := strings.Split(filter, ",")
-
-	for _, tag := range tags {
-		tag = strings.ToLower(tag)
-
-		for _, filter := range filterTags {
-			filter = strings.ToLower(filter)
-			filter = strings.Trim(filter, " ")
-			// check if line contains * or ?, if so try wildcard match, otherwise try substring match
-			a := strings.ContainsAny(filter, "?|*")
-			if a {
-				match := wildcard.Match(filter, tag)
-				if match {
-					return true
-				}
-			} else {
-				b := strings.Contains(tag, filter)
-				if b {
-					return true
-				}
-			}
-		}
-	}
-
-	return false
-}
-
-func checkFreeleechPercent(announcePercent int, filterPercent string) bool {
-	filters := strings.Split(filterPercent, ",")
-
-	// remove % and trim spaces
-	//announcePercent = strings.Replace(announcePercent, "%", "", -1)
-	//announcePercent = strings.Trim(announcePercent, " ")
-
-	//announcePercentInt, err := strconv.ParseInt(announcePercent, 10, 32)
-	//if err != nil {
-	//	return false
-	//}
-
-	for _, s := range filters {
-		s = strings.Replace(s, "%", "", -1)
-		s = strings.Trim(s, " ")
-
-		if strings.Contains(s, "-") {
-			minMax := strings.Split(s, "-")
-
-			// to int
-			min, err := strconv.ParseInt(minMax[0], 10, 32)
-			if err != nil {
-				return false
-			}
-
-			max, err := strconv.ParseInt(minMax[1], 10, 32)
-			if err != nil {
-				return false
-			}
-
-			if min > max {
-				// handle error
-				return false
-			} else {
-				// if announcePercent is greater than min and less than max return true
-				if announcePercent >= int(min) && announcePercent <= int(max) {
-					return true
-				}
-			}
-		}
-
-		filterPercentInt, err := strconv.ParseInt(s, 10, 32)
-		if err != nil {
-			return false
-		}
-
-		if int(filterPercentInt) == announcePercent {
-			return true
-		}
-	}
-
-	return false
 }
 
 func getStringMapValue(stringMap map[string]string, key string) (string, error) {
 	lowerKey := strings.ToLower(key)
-
-	// case-sensitive match
-	//if caseSensitive {
-	//	v, ok := stringMap[key]
-	//	if !ok {
-	//		return "", fmt.Errorf("key was not found in map: %q", key)
-	//	}
-	//
-	//	return v, nil
-	//}
 
 	// case-insensitive match
 	for k, v := range stringMap {
@@ -1309,119 +1185,7 @@ func getStringMapValue(stringMap map[string]string, key string) (string, error) 
 		}
 	}
 
-	return "", fmt.Errorf("key was not found in map: %q", lowerKey)
-}
-
-func getFirstStringMapValue(stringMap map[string]string, keys []string) (string, error) {
-	for _, k := range keys {
-		if val, err := getStringMapValue(stringMap, k); err == nil {
-			return val, nil
-		}
-	}
-
-	return "", fmt.Errorf("key were not found in map: %q", strings.Join(keys, ", "))
-}
-
-func findLast(input string, pattern string) (string, error) {
-	matched := make([]string, 0)
-	//for _, s := range arr {
-
-	rxp, err := regexp.Compile(pattern)
-	if err != nil {
-		return "", err
-		//return errors.Wrapf(err, "invalid regex: %s", value)
-	}
-
-	matches := rxp.FindStringSubmatch(input)
-	if matches != nil {
-		// first value is the match, second value is the text
-		if len(matches) >= 1 {
-			last := matches[len(matches)-1]
-
-			// add to temp slice
-			matched = append(matched, last)
-		}
-	}
-
-	//}
-
-	// check if multiple values in temp slice, if so get the last one
-	if len(matched) >= 1 {
-		last := matched[len(matched)-1]
-
-		return last, nil
-	}
-
-	return "", nil
-}
-
-func findLastBool(input string, pattern string) (bool, error) {
-	matched := make([]string, 0)
-
-	rxp, err := regexp.Compile(pattern)
-	if err != nil {
-		return false, err
-	}
-
-	matches := rxp.FindStringSubmatch(input)
-	if matches != nil {
-		// first value is the match, second value is the text
-		if len(matches) >= 1 {
-			last := matches[len(matches)-1]
-
-			// add to temp slice
-			matched = append(matched, last)
-		}
-	}
-
-	//}
-
-	// check if multiple values in temp slice, if so get the last one
-	if len(matched) >= 1 {
-		//last := matched[len(matched)-1]
-
-		return true, nil
-	}
-
-	return false, nil
-}
-
-func findLastInt(input string, pattern string) (int, error) {
-	matched := make([]string, 0)
-	//for _, s := range arr {
-
-	rxp, err := regexp.Compile(pattern)
-	if err != nil {
-		return 0, err
-		//return errors.Wrapf(err, "invalid regex: %s", value)
-	}
-
-	matches := rxp.FindStringSubmatch(input)
-	if matches != nil {
-		// first value is the match, second value is the text
-		if len(matches) >= 1 {
-			last := matches[len(matches)-1]
-
-			// add to temp slice
-			matched = append(matched, last)
-		}
-	}
-
-	//}
-
-	// check if multiple values in temp slice, if so get the last one
-	if len(matched) >= 1 {
-		last := matched[len(matched)-1]
-
-		i, err := strconv.Atoi(last)
-		if err != nil {
-			return 0, err
-		}
-
-		return i, nil
-	}
-
-	return 0, nil
+	return "", errors.New("key was not found in map: %q", lowerKey)
 }
 
 func SplitAny(s string, seps string) []string {
@@ -1431,100 +1195,62 @@ func SplitAny(s string, seps string) []string {
 	return strings.FieldsFunc(s, splitter)
 }
 
-//func Splitter(s string, splits string) []string {
-//	m := make(map[rune]int)
-//	for _, r := range splits {
-//		m[r] = 1
-//	}
-//
-//	splitter := func(r rune) bool {
-//		return m[r] == 1
-//	}
-//
-//	return strings.FieldsFunc(s, splitter)
-//}
-//
-//func canonicalizeString(s string) []string {
-//	//a := strings.FieldsFunc(s, split)
-//	a := Splitter(s, " .")
-//
-//	return a
-//}
-
-func cleanReleaseName(input string) string {
-	// Make a Regex to say we only want letters and numbers
-	reg, err := regexp.Compile(`[\x00-\x1F\x2D\x2E\x5F\x7F]`)
-	if err != nil {
-		return ""
+func StringEqualFoldMulti(s string, values ...string) bool {
+	for _, value := range values {
+		if strings.EqualFold(s, value) {
+			return true
+		}
 	}
-	processedString := reg.ReplaceAllString(input, " ")
-
-	return processedString
+	return false
 }
 
-type DownloadTorrentFileResponse struct {
-	MetaInfo    *metainfo.MetaInfo
-	TmpFileName string
-}
+func getUniqueTags(target []string, source []string) []string {
+	toAppend := make([]string, 0, len(source))
 
-type ReleaseStats struct {
-	TotalCount          int64 `json:"total_count"`
-	FilteredCount       int64 `json:"filtered_count"`
-	FilterRejectedCount int64 `json:"filter_rejected_count"`
-	PushApprovedCount   int64 `json:"push_approved_count"`
-	PushRejectedCount   int64 `json:"push_rejected_count"`
-}
+	for _, t := range source {
+		found := false
+		norm := rls.MustNormalize(t)
 
-type ReleasePushStatus string
+		for _, s := range target {
+			if rls.MustNormalize(s) == norm {
+				found = true
+				break
+			}
+		}
 
-const (
-	ReleasePushStatusApproved ReleasePushStatus = "PUSH_APPROVED"
-	ReleasePushStatusRejected ReleasePushStatus = "PUSH_REJECTED"
-	ReleasePushStatusErr      ReleasePushStatus = "PUSH_ERROR"
-	ReleasePushStatusPending  ReleasePushStatus = "PENDING" // Initial status
-)
-
-func (r ReleasePushStatus) String() string {
-	switch r {
-	case ReleasePushStatusApproved:
-		return "Approved"
-	case ReleasePushStatusRejected:
-		return "Rejected"
-	case ReleasePushStatusErr:
-		return "Error"
-	default:
-		return "Unknown"
+		if !found {
+			toAppend = append(toAppend, t)
+		}
 	}
+
+	target = append(target, toAppend...)
+
+	return target
 }
 
-type ReleaseFilterStatus string
-
-const (
-	ReleaseStatusFilterApproved ReleaseFilterStatus = "FILTER_APPROVED"
-	ReleaseStatusFilterRejected ReleaseFilterStatus = "FILTER_REJECTED"
-	ReleaseStatusFilterPending  ReleaseFilterStatus = "PENDING"
-)
-
-type ReleaseProtocol string
-
-const (
-	ReleaseProtocolTorrent ReleaseProtocol = "torrent"
-)
-
-type ReleaseImplementation string
-
-const (
-	ReleaseImplementationIRC ReleaseImplementation = "IRC"
-)
-
-type ReleaseQueryParams struct {
-	Limit   uint64
-	Offset  uint64
-	Cursor  uint64
-	Sort    map[string]string
-	Filters struct {
-		Indexers   []string
-		PushStatus string
-	}
-	Search string
+type DuplicateReleaseProfile struct {
+	ID           int64  `json:"id"`
+	Name         string `json:"name"`
+	Protocol     bool   `json:"protocol"`
+	ReleaseName  bool   `json:"release_name"`
+	Hash         bool   `json:"hash"`
+	Title        bool   `json:"title"`
+	SubTitle     bool   `json:"sub_title"`
+	Year         bool   `json:"year"`
+	Month        bool   `json:"month"`
+	Day          bool   `json:"day"`
+	Source       bool   `json:"source"`
+	Resolution   bool   `json:"resolution"`
+	Codec        bool   `json:"codec"`
+	Container    bool   `json:"container"`
+	DynamicRange bool   `json:"dynamic_range"`
+	Audio        bool   `json:"audio"`
+	Group        bool   `json:"group"`
+	Season       bool   `json:"season"`
+	Episode      bool   `json:"episode"`
+	Website      bool   `json:"website"`
+	Proper       bool   `json:"proper"`
+	Repack       bool   `json:"repack"`
+	Edition      bool   `json:"edition"`
+	Language     bool   `json:"language"`
 }

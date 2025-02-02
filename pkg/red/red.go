@@ -1,48 +1,68 @@
+// Copyright (c) 2021 - 2025, Ludvig Lundgren and the autobrr contributors.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 package red
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"strconv"
 	"time"
-	
-	"github.com/rs/zerolog/log"
-	"golang.org/x/time/rate"
 
 	"github.com/autobrr/autobrr/internal/domain"
+	"github.com/autobrr/autobrr/pkg/errors"
+	"github.com/autobrr/autobrr/pkg/sharedhttp"
+
+	"golang.org/x/time/rate"
 )
 
-type REDClient interface {
-	GetTorrentByID(torrentID string) (*domain.TorrentBasic, error)
-	TestAPI() (bool, error)
+const DefaultURL = "https://redacted.sh/ajax.php"
+
+type ApiClient interface {
+	GetTorrentByID(ctx context.Context, torrentID string) (*domain.TorrentBasic, error)
+	TestAPI(ctx context.Context) (bool, error)
 }
 
 type Client struct {
-	URL         string
-	Timeout     int
+	url         string
 	client      *http.Client
-	RateLimiter *rate.Limiter
+	rateLimiter *rate.Limiter
 	APIKey      string
 }
 
-func NewClient(url string, apiKey string) REDClient {
-	if url == "" {
-		url = "https://redacted.ch/ajax.php"
+type OptFunc func(*Client)
+
+func WithUrl(url string) OptFunc {
+	return func(c *Client) {
+		c.url = url
+	}
+}
+
+func NewClient(apiKey string, opts ...OptFunc) ApiClient {
+	c := &Client{
+		url: DefaultURL,
+		client: &http.Client{
+			Timeout:   time.Second * 30,
+			Transport: sharedhttp.Transport,
+		},
+		rateLimiter: rate.NewLimiter(rate.Every(10*time.Second), 10),
+		APIKey:      apiKey,
 	}
 
-	c := &Client{
-		APIKey:      apiKey,
-		client:      http.DefaultClient,
-		URL:         url,
-		RateLimiter: rate.NewLimiter(rate.Every(10*time.Second), 10),
+	for _, opt := range opts {
+		opt(c)
 	}
 
 	return c
+}
+
+type ErrorResponse struct {
+	Status string `json:"status"`
+	Error  string `json:"error,omitempty"`
 }
 
 type TorrentDetailsResponse struct {
@@ -85,54 +105,83 @@ type Group struct {
 }
 
 type Torrent struct {
-	Id                      int    `json:"id"`
-	InfoHash                string `json:"infoHash"`
-	Media                   string `json:"media"`
-	Format                  string `json:"format"`
-	Encoding                string `json:"encoding"`
-	Remastered              bool   `json:"remastered"`
-	RemasterYear            int    `json:"remasterYear"`
-	RemasterTitle           string `json:"remasterTitle"`
-	RemasterRecordLabel     string `json:"remasterRecordLabel"`
-	RemasterCatalogueNumber string `json:"remasterCatalogueNumber"`
-	Scene                   bool   `json:"scene"`
-	HasLog                  bool   `json:"hasLog"`
-	HasCue                  bool   `json:"hasCue"`
-	LogScore                int    `json:"logScore"`
-	FileCount               int    `json:"fileCount"`
-	Size                    int    `json:"size"`
-	Seeders                 int    `json:"seeders"`
-	Leechers                int    `json:"leechers"`
-	Snatched                int    `json:"snatched"`
-	FreeTorrent             bool   `json:"freeTorrent"`
-	IsNeutralleech          bool   `json:"isNeutralleech"`
-	IsFreeload              bool   `json:"isFreeload"`
-	Time                    string `json:"time"`
-	Description             string `json:"description"`
-	FileList                string `json:"fileList"`
-	FilePath                string `json:"filePath"`
-	UserId                  int    `json:"userId"`
-	Username                string `json:"username"`
+	Id              int    `json:"id"`
+	InfoHash        string `json:"infoHash"`
+	Media           string `json:"media"`
+	Format          string `json:"format"`
+	Encoding        string `json:"encoding"`
+	Remastered      bool   `json:"remastered"`
+	RemasterYear    int    `json:"remasterYear"`
+	RemasterTitle   string `json:"remasterTitle"`
+	RecordLabel     string `json:"remasterRecordLabel"`     // remasterRecordLabel is the record label of the release, which should be used instead of the record label of the group
+	CatalogueNumber string `json:"remasterCatalogueNumber"` // remasterCatalogueNumber is the catalogue number of the release, which should be used instead of the catalogue number of the group
+	Scene           bool   `json:"scene"`
+	HasLog          bool   `json:"hasLog"`
+	HasCue          bool   `json:"hasCue"`
+	LogScore        int    `json:"logScore"`
+	FileCount       int    `json:"fileCount"`
+	Size            int    `json:"size"`
+	Seeders         int    `json:"seeders"`
+	Leechers        int    `json:"leechers"`
+	Snatched        int    `json:"snatched"`
+	FreeTorrent     bool   `json:"freeTorrent"`
+	IsNeutralleech  bool   `json:"isNeutralleech"`
+	IsFreeload      bool   `json:"isFreeload"`
+	Time            string `json:"time"`
+	Description     string `json:"description"`
+	FileList        string `json:"fileList"`
+	FilePath        string `json:"filePath"`
+	UserId          int    `json:"userId"`
+	Username        string `json:"username"`
+}
+
+type IndexResponse struct {
+	Status   string `json:"status"`
+	Response struct {
+		Username      string `json:"username"`
+		Id            int    `json:"id"`
+		Authkey       string `json:"authkey"`
+		Passkey       string `json:"passkey"`
+		ApiVersion    string `json:"api_version"`
+		Notifications struct {
+			Messages        int  `json:"messages"`
+			Notifications   int  `json:"notifications"`
+			NewAnnouncement bool `json:"newAnnouncement"`
+			NewBlog         bool `json:"newBlog"`
+		} `json:"notifications"`
+		UserStats struct {
+			Uploaded      int64   `json:"uploaded"`
+			Downloaded    int64   `json:"downloaded"`
+			Ratio         float64 `json:"ratio"`
+			RequiredRatio float64 `json:"requiredratio"`
+			Class         string  `json:"class"`
+		} `json:"userstats"`
+	} `json:"response"`
 }
 
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
-	ctx := context.Background()
-	err := c.RateLimiter.Wait(ctx) // This is a blocking call. Honors the rate limit
+	//ctx := context.Background()
+	err := c.rateLimiter.Wait(req.Context()) // This is a blocking call. Honors the rate limit
 	if err != nil {
 		return nil, err
 	}
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return nil, err
+		return resp, err
 	}
 	return resp, nil
 }
 
-func (c *Client) get(url string) (*http.Response, error) {
-	req, err := http.NewRequest(http.MethodGet, url, http.NoBody)
+func (c *Client) getJSON(ctx context.Context, params url.Values, data any) error {
+	if c.APIKey == "" {
+		return errors.New("RED client missing API key!")
+	}
+
+	reqUrl := fmt.Sprintf("%s?%s", c.url, params.Encode())
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqUrl, http.NoBody)
 	if err != nil {
-		log.Error().Err(err).Msgf("red client request error : %v", url)
-		return nil, err
+		return errors.Wrap(err, "could not build request")
 	}
 
 	req.Header.Add("Authorization", c.APIKey)
@@ -140,73 +189,82 @@ func (c *Client) get(url string) (*http.Response, error) {
 
 	res, err := c.Do(req)
 	if err != nil {
-		log.Error().Err(err).Msgf("red client request error : %v", url)
-		return nil, err
+		return errors.Wrap(err, "could not make request: %+v", req)
 	}
 
-	if res.StatusCode == http.StatusUnauthorized {
-		return nil, errors.New("unauthorized: bad credentials")
-	} else if res.StatusCode == http.StatusForbidden {
-		return nil, nil
-	} else if res.StatusCode == http.StatusBadRequest {
-		return nil, errors.New("bad id parameter")
-	} else if res.StatusCode == http.StatusTooManyRequests {
-		return nil, errors.New("rate-limited")
+	defer res.Body.Close()
+
+	body := bufio.NewReader(res.Body)
+
+	// return early if not OK
+	if res.StatusCode != http.StatusOK {
+		var errResponse ErrorResponse
+
+		if err := json.NewDecoder(body).Decode(&errResponse); err != nil {
+			return errors.Wrap(err, "could not unmarshal body")
+		}
+
+		return errors.New("status code: %d status: %s error: %s", res.StatusCode, errResponse.Status, errResponse.Error)
 	}
 
-	return res, nil
+	if err := json.NewDecoder(body).Decode(&data); err != nil {
+		return errors.Wrap(err, "could not unmarshal body")
+	}
+
+	return nil
 }
 
-func (c *Client) GetTorrentByID(torrentID string) (*domain.TorrentBasic, error) {
+func (c *Client) GetTorrentByID(ctx context.Context, torrentID string) (*domain.TorrentBasic, error) {
 	if torrentID == "" {
-		return nil, fmt.Errorf("red client: must have torrentID")
+		return nil, errors.New("red client: must have torrentID")
 	}
 
-	var r TorrentDetailsResponse
+	var response TorrentDetailsResponse
 
-	v := url.Values{}
-	v.Add("id", torrentID)
-	params := v.Encode()
+	params := url.Values{}
+	params.Add("action", "torrent")
+	params.Add("id", torrentID)
 
-	url := fmt.Sprintf("%v?action=torrent&%v", c.URL, params)
-
-	resp, err := c.get(url)
+	err := c.getJSON(ctx, params, &response)
 	if err != nil {
-		return nil, err
-	}
-
-	defer resp.Body.Close()
-
-	body, readErr := ioutil.ReadAll(resp.Body)
-	if readErr != nil {
-		return nil, readErr
-	}
-
-	err = json.Unmarshal(body, &r)
-	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "could not get torrent by id: %v", torrentID)
 	}
 
 	return &domain.TorrentBasic{
-		Id:       strconv.Itoa(r.Response.Torrent.Id),
-		InfoHash: r.Response.Torrent.InfoHash,
-		Size:     strconv.Itoa(r.Response.Torrent.Size),
+		Id:          strconv.Itoa(response.Response.Torrent.Id),
+		InfoHash:    response.Response.Torrent.InfoHash,
+		Size:        strconv.Itoa(response.Response.Torrent.Size),
+		Uploader:    response.Response.Torrent.Username,
+		RecordLabel: response.Response.Torrent.RecordLabel,
 	}, nil
 
 }
 
 // TestAPI try api access against torrents page
-func (c *Client) TestAPI() (bool, error) {
-	resp, err := c.get(c.URL + "?action=index")
+func (c *Client) TestAPI(ctx context.Context) (bool, error) {
+	resp, err := c.GetIndex(ctx)
 	if err != nil {
-		return false, err
+		return false, errors.Wrap(err, "test api error")
 	}
 
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusOK {
-		return true, nil
+	if resp == nil {
+		return false, nil
 	}
 
-	return false, nil
+	return true, nil
+}
+
+// GetIndex get API index
+func (c *Client) GetIndex(ctx context.Context) (*IndexResponse, error) {
+	var response IndexResponse
+
+	params := url.Values{}
+	params.Add("action", "index")
+
+	err := c.getJSON(ctx, params, &response)
+	if err != nil {
+		return nil, errors.Wrap(err, "test api error")
+	}
+
+	return &response, nil
 }

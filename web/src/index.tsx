@@ -1,7 +1,12 @@
-import { StrictMode } from "react";
-import ReactDOM from "react-dom";
+/*
+ * Copyright (c) 2021 - 2025, Ludvig Lundgren and the autobrr contributors.
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
 
-import "@fontsource/inter/variable.css";
+import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+import { Buffer } from "buffer";
+
 import "./index.css";
 
 import { App } from "./App";
@@ -12,13 +17,16 @@ declare global {
 }
 
 window.APP = window.APP || {};
+// Apparently Stacktracey requires this for some weird reason
+// (at least in local dev env)
+window.Buffer = Buffer;
 
 // Initializes auth and theme contexts
 InitializeGlobalContext();
 
-ReactDOM.render(
-    <StrictMode>
-        <App />
-    </StrictMode>,
-    document.getElementById("root")
+const root = createRoot(document.getElementById("root")!);
+root.render(
+  <StrictMode>
+    <App />
+  </StrictMode>
 );

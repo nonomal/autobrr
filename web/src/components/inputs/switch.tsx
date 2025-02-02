@@ -1,126 +1,111 @@
-import { Field } from "formik";
-import type {
-    FieldInputProps,
-    FieldMetaProps,
-    FieldProps,
-    FormikProps,
-    FormikValues
-} from "formik";
-import { Switch as HeadlessSwitch } from "@headlessui/react";
-import { classNames } from "../../utils";
+/*
+ * Copyright (c) 2021 - 2025, Ludvig Lundgren and the autobrr contributors.
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
 
-type SwitchProps<V = any> = {
-    label: string
-    checked: boolean
-    disabled?: boolean
-    onChange: (value: boolean) => void
-    field?: FieldInputProps<V>
-    form?: FormikProps<FormikValues>
-    meta?: FieldMetaProps<V>
-}
+import type { FieldProps } from "formik";
+import { Field as FormikField } from "formik";
+import { Field, Label, Description } from "@headlessui/react";
 
-export const Switch = ({
-    label,
-    checked: $checked,
-    disabled = false,
-    onChange: $onChange,
-    field,
-    form,
-}: SwitchProps) => {
-    const checked = field?.checked ?? $checked
-
-    return (
-        <HeadlessSwitch.Group as="div" className="flex items-center space-x-4">
-            <HeadlessSwitch.Label>{label}</HeadlessSwitch.Label>
-            <HeadlessSwitch
-                as="button"
-                name={field?.name}
-                disabled={disabled}
-                checked={checked}
-                onChange={value => {
-                    form?.setFieldValue(field?.name ?? '', value)
-                    $onChange && $onChange(value)
-                }}
-
-                className={classNames(
-                    checked ? 'bg-teal-500 dark:bg-blue-500' : 'bg-gray-200 dark:bg-gray-600',
-                    'ml-4 relative inline-flex flex-shrink-0 h-6 w-11 border-2 border-transparent rounded-full cursor-pointer transition-colors ease-in-out duration-200 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500'
-                )}
-            >
-                {({ checked }) => (
-                    <span
-                        aria-hidden="true"
-                        className={classNames(
-                            checked ? 'translate-x-5' : 'translate-x-0',
-                            'inline-block h-5 w-5 rounded-full bg-white shadow transform ring-0 transition ease-in-out duration-200'
-                        )}
-                    />
-                )}
-            </HeadlessSwitch>
-        </HeadlessSwitch.Group>
-    )
-}
-
-export type SwitchFormikProps = SwitchProps & FieldProps & React.InputHTMLAttributes<HTMLInputElement>;
-
-export const SwitchFormik = (props: SwitchProps) => <Switch {...props} />
+import { classNames } from "@utils";
+import { DocsTooltip } from "@components/tooltips/DocsTooltip";
+import { Checkbox } from "@components/Checkbox";
 
 interface SwitchGroupProps {
-    name: string;
-    label?: string;
-    description?: string;
-    className?: string;
+  name: string;
+  label?: string;
+  description?: string | React.ReactNode;
+  heading?: boolean;
+  tooltip?: JSX.Element;
+  disabled?: boolean;
+  className?: string;
 }
 
 const SwitchGroup = ({
-    name,
-    label,
-    description
+  name,
+  label,
+  description,
+  tooltip,
+  heading,
+  disabled,
+  className
 }: SwitchGroupProps) => (
-    <HeadlessSwitch.Group as="li" className="py-4 flex items-center justify-between">
-        {label && <div className="flex flex-col">
-            <HeadlessSwitch.Label as="p" className="text-sm font-medium text-gray-900 dark:text-gray-100"
-                passive>
-                {label}
-            </HeadlessSwitch.Label>
-            {description && (
-                <HeadlessSwitch.Description className="text-sm mt-1 text-gray-500 dark:text-gray-400">
-                    {description}
-                </HeadlessSwitch.Description>
-            )}
+  <Field
+    as="div"
+    className={classNames(
+      className ?? "py-2",
+      "flex items-center justify-between"
+    )}
+  >
+    {label && <div className="flex flex-col">
+      <Label
+        passive
+        as={heading ? "h2" : "span"}
+        className={classNames(
+          "flex float-left ml-px cursor-default text-xs font-bold text-gray-800 dark:text-gray-100 uppercase tracking-wide",
+          heading ? "text-lg" : "text-sm"
+        )}
+      >
+        <div className="flex">
+          {tooltip ? (
+            <DocsTooltip label={label}>{tooltip}</DocsTooltip>
+          ) : label}
         </div>
-        }
+      </Label>
+      {description && (
+        <Description as="span" className="text-sm mt-1 pr-4 text-gray-500 dark:text-gray-400">
+          {description}
+        </Description>
+      )}
+    </div>
+    }
 
-        <Field name={name} type="checkbox">
-            {({
-                field,
-                form: { setFieldValue },
-            }: any) => (
-                <Switch
-                    {...field}
-                    type="button"
-                    value={field.value}
-                    checked={field.checked}
-                    onChange={value => {
-                        setFieldValue(field?.name ?? '', value)
-                    }}
-                    className={classNames(
-                        field.value ? 'bg-teal-500 dark:bg-blue-500' : 'bg-gray-200',
-                        'ml-4 relative inline-flex flex-shrink-0 h-6 w-11 border-2 border-transparent rounded-full cursor-pointer transition-colors ease-in-out duration-200 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500'
-                    )}
-                >
-                    <span
-                        aria-hidden="true"
-                        className={classNames(
-                            field.value ? 'translate-x-5' : 'translate-x-0',
-                            'inline-block h-5 w-5 rounded-full bg-white shadow transform ring-0 transition ease-in-out duration-200'
-                        )}
-                    />
-                </Switch>
-
-            )}
-        </Field>
-    </HeadlessSwitch.Group>
+    <FormikField name={name} type="checkbox">
+      {({
+        field,
+        form: { setFieldValue }
+      }: FieldProps) => (
+        <Checkbox
+          {...field}
+          className=""
+          value={!!field.checked}
+          setValue={(value) => {
+            setFieldValue(field?.name ?? "", value);
+          }}
+          disabled={disabled}
+        />
+      )}
+    </FormikField>
+  </Field>
 );
 
-export { SwitchGroup }
+interface SwitchButtonProps {
+  name: string;
+  defaultValue?: boolean;
+  className?: string;
+}
+
+const SwitchButton = ({ name, defaultValue }: SwitchButtonProps) => (
+    <Field as="div" className="flex items-center justify-between">
+      <FormikField
+        name={name}
+        defaultValue={defaultValue as boolean}
+        type="checkbox"
+      >
+        {({
+            field,
+            form: { setFieldValue }
+          }: FieldProps) => (
+          <Checkbox
+            {...field}
+            value={!!field.checked}
+            setValue={(value) => {
+              setFieldValue(field?.name ?? "", value);
+            }}
+          />
+        )}
+      </FormikField>
+    </Field>
+);
+
+export { SwitchGroup, SwitchButton };

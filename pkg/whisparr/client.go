@@ -1,25 +1,31 @@
+// Copyright (c) 2021 - 2025, Ludvig Lundgren and the autobrr contributors.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 package whisparr
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/url"
 	"path"
 
-	"github.com/rs/zerolog/log"
+	"github.com/autobrr/autobrr/pkg/errors"
 )
 
-func (c *client) get(endpoint string) (*http.Response, error) {
+func (c *client) get(ctx context.Context, endpoint string) (*http.Response, error) {
 	u, err := url.Parse(c.config.Hostname)
+	if err != nil {
+		return nil, errors.Wrap(err, "could not parse url: %s", c.config.Hostname)
+	}
+
 	u.Path = path.Join(u.Path, "/api/v3/", endpoint)
 	reqUrl := u.String()
 
-	req, err := http.NewRequest(http.MethodGet, reqUrl, http.NoBody)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqUrl, http.NoBody)
 	if err != nil {
-		log.Error().Err(err).Msgf("whisparr client request error : %v", reqUrl)
-		return nil, err
+		return nil, errors.Wrap(err, "could not build request")
 	}
 
 	if c.config.BasicAuth {
@@ -31,8 +37,7 @@ func (c *client) get(endpoint string) (*http.Response, error) {
 
 	res, err := c.http.Do(req)
 	if err != nil {
-		log.Error().Err(err).Msgf("whisparr client request error : %v", reqUrl)
-		return nil, err
+		return nil, errors.Wrap(err, "could not make request: %+v", req)
 	}
 
 	if res.StatusCode == http.StatusUnauthorized {
@@ -42,21 +47,23 @@ func (c *client) get(endpoint string) (*http.Response, error) {
 	return res, nil
 }
 
-func (c *client) post(endpoint string, data interface{}) (*http.Response, error) {
+func (c *client) post(ctx context.Context, endpoint string, data interface{}) (*http.Response, error) {
 	u, err := url.Parse(c.config.Hostname)
+	if err != nil {
+		return nil, errors.Wrap(err, "could not parse url: %s", c.config.Hostname)
+	}
+
 	u.Path = path.Join(u.Path, "/api/v3/", endpoint)
 	reqUrl := u.String()
 
 	jsonData, err := json.Marshal(data)
 	if err != nil {
-		log.Error().Err(err).Msgf("whisparr client could not marshal data: %v", reqUrl)
-		return nil, err
+		return nil, errors.Wrap(err, "could not marshal data: %+v", data)
 	}
 
-	req, err := http.NewRequest(http.MethodPost, reqUrl, bytes.NewBuffer(jsonData))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqUrl, bytes.NewBuffer(jsonData))
 	if err != nil {
-		log.Error().Err(err).Msgf("whisparr client request error: %v", reqUrl)
-		return nil, err
+		return nil, errors.Wrap(err, "could not build request")
 	}
 
 	if c.config.BasicAuth {
@@ -69,16 +76,13 @@ func (c *client) post(endpoint string, data interface{}) (*http.Response, error)
 
 	res, err := c.http.Do(req)
 	if err != nil {
-		log.Error().Err(err).Msgf("whisparr client request error: %v", reqUrl)
-		return nil, err
+		return nil, errors.Wrap(err, "could not make request: %+v", req)
 	}
 
 	// validate response
 	if res.StatusCode == http.StatusUnauthorized {
-		log.Error().Err(err).Msgf("whisparr client bad request: %v", reqUrl)
 		return nil, errors.New("unauthorized: bad credentials")
 	} else if res.StatusCode != http.StatusOK {
-		log.Error().Err(err).Msgf("whisparr client request error: %v", reqUrl)
 		return nil, errors.New("whisparr: bad request")
 	}
 

@@ -1,12 +1,20 @@
+version: 2
+
 before:
   hooks:
     - go mod tidy
 
 builds:
   - id: autobrr
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -pgo=cpu.pprof
     goos:
       - linux
       - windows
+      - darwin
+      - freebsd
     goarch:
       - amd64
       - arm
@@ -18,12 +26,22 @@ builds:
         goarch: arm
       - goos: windows
         goarch: arm64
+      - goos: darwin
+        goarch: arm
+      - goos: freebsd
+        goarch: arm
+      - goos: freebsd
+        goarch: arm64
     main: ./cmd/autobrr/main.go
     binary: autobrr
   - id: autobrrctl
+    env:
+      - CGO_ENABLED=0
     goos:
       - linux
       - windows
+      - darwin
+      - freebsd
     goarch:
       - amd64
       - arm
@@ -34,6 +52,12 @@ builds:
       - goos: windows
         goarch: arm
       - goos: windows
+        goarch: arm64
+      - goos: darwin
+        goarch: arm
+      - goos: freebsd
+        goarch: arm
+      - goos: freebsd
         goarch: arm64
     main: ./cmd/autobrrctl/main.go
     binary: autobrrctl
@@ -43,27 +67,32 @@ archives:
     builds:
       - autobrr
       - autobrrctl
-    files:
-      - none*
-    replacements:
-      amd64: x86_64
+    format_overrides:
+      - goos: windows
+        format: zip
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else }}{{ .Arch }}{{ end }}
 
 release:
   prerelease: auto
   footer: |
     **Full Changelog**: https://github.com/autobrr/autobrr/compare/{{ .PreviousTag }}...{{ .Tag }}
-    
+
     ## Docker images
-    
+
     - `docker pull ghcr.io/autobrr/autobrr:{{ .Tag }}`
-    
+
     ## What to do next?
-    
-    - Read the [documentation](https://autobrr.com/docs/introduction)
+
+    - Read the [documentation](https://autobrr.com)
     - Join our [Discord server](https://discord.gg/WQ2eUycxyT)
 
 checksum:
-  name_template: '{{ .ProjectName }}_{{ .Version }}_checksums.txt'
+  name_template: "{{ .ProjectName }}_{{ .Version }}_checksums.txt"
 
 changelog:
   sort: asc
@@ -74,11 +103,26 @@ changelog:
       - Merge remote-tracking branch
       - Merge branch
   groups:
-    - title: 'New Features'
+    - title: "New Features"
       regexp: "^.*feat[(\\w)]*:+.*$"
       order: 0
-    - title: 'Bug fixes'
+    - title: "Bug fixes"
       regexp: "^.*fix[(\\w)]*:+.*$"
       order: 10
     - title: Other work
       order: 999
+
+nfpms:
+  - package_name: autobrr
+    homepage: https://autobrr.com
+    maintainer: Autobrr <packages@autobrr.com>
+    description: |-
+      autobrr is the modern download automation tool for torrents and usenet.
+    contents:
+      - src: docs/man/autobrr.1
+        dst: /usr/share/man/man1/autobrr.1
+    formats:
+      - apk
+      - deb
+      - rpm
+      - archlinux

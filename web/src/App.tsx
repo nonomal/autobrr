@@ -1,49 +1,46 @@
-import { Fragment } from "react";
-import { BrowserRouter as Router, Route, Switch } from "react-router-dom";
-import { QueryClient, QueryClientProvider } from "react-query";
-import { ReactQueryDevtools } from "react-query/devtools";
-import { Toaster } from "react-hot-toast";
+/*
+ * Copyright (c) 2021 - 2025, Ludvig Lundgren and the autobrr contributors.
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
 
-import Base from "./screens/Base";
-import { Login } from "./screens/auth/login";
-import { Logout } from "./screens/auth/logout";
-import { Onboarding } from "./screens/auth/onboarding";
-import { baseUrl } from "./utils";
+import { useEffect } from "react";
+import { RouterProvider } from "@tanstack/react-router"
+import { QueryClientProvider } from "@tanstack/react-query";
+import { Toaster } from "@components/hot-toast";
+import { Router } from "@app/routes";
+import { routerBasePath } from "@utils";
+import { queryClient } from "@api/QueryClient";
+import { SettingsContext } from "@utils/Context";
+import { Portal } from "@components/portal";
 
-import { AuthContext, SettingsContext } from "./utils/Context";
-
-function Protected() {
-  return (
-    <Fragment>
-      <Toaster position="top-right" />
-      <Base />
-    </Fragment>
-  )
+declare module '@tanstack/react-router' {
+  interface Register {
+    router: typeof Router
+  }
 }
 
-export const queryClient = new QueryClient();
-
 export function App() {
-  const authContext = AuthContext.useValue();
-  const settings = SettingsContext.useValue();
+  const [ , setSettings] = SettingsContext.use();
+
+  useEffect(() => {
+    const themeMediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
+    const handleThemeChange = (e: MediaQueryListEvent) => {
+      setSettings(prevState => ({ ...prevState, darkTheme: e.matches }));
+    };
+
+    themeMediaQuery.addEventListener('change', handleThemeChange);
+    return () => themeMediaQuery.removeEventListener('change', handleThemeChange);
+  }, [setSettings]);
 
   return (
     <QueryClientProvider client={queryClient}>
-      <Router basename={baseUrl()}>
-        <Route exact path="/logout" component={Logout} />
-
-        {authContext.isLoggedIn ? (
-          <Route component={Protected} />
-        ) : (
-          <Switch>
-            <Route exact path="/onboard" component={Onboarding} />
-            <Route component={Login} />
-          </Switch>
-        )}
-      </Router>
-      {settings.debug ? (
-        <ReactQueryDevtools initialIsOpen={false} />
-      ) : null}
+      <Portal>
+        <Toaster position="top-right" />
+      </Portal>
+      <RouterProvider
+        basepath={routerBasePath()}
+        router={Router}
+      />
     </QueryClientProvider>
   );
 }
